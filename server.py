@@ -8,10 +8,15 @@ import base64
 import datetime
 import io
 import json
+import os
+import pathlib
 import platform
+import plistlib
 import re
+import signal
 import socket
 import sys
+import time
 
 import matplotlib
 matplotlib.use("Agg")
@@ -39,6 +44,14 @@ def _classify_pressure(percent: float) -> str:
     if percent >= 75: return "high"
     if percent >= 50: return "moderate"
     return "low"
+
+
+_PROTECTED_PIDS  = {0, 1}
+_PROTECTED_NAMES = frozenset({
+    "launchd", "systemd", "init", "kernel_task",
+    "svchost.exe", "winlogon.exe", "csrss.exe",
+    "smss.exe", "wininit.exe", "lsass.exe", "services.exe",
+})
 
 
 def _detect_cpu_oc(cpu_brand: str, system: str, machine: str) -> dict:
@@ -282,8 +295,41 @@ def get_network_usage() -> dict:
     }
 
 
+def get_realtime_io(interval: int = 1) -> dict:
+    interval = max(1, min(interval, 3))
+    d1 = psutil.disk_io_counters()
+    n1 = psutil.net_io_counters()
+    time.sleep(interval)
+    d2 = psutil.disk_io_counters()
+    n2 = psutil.net_io_counters()
+    dt = float(interval)
+
+    if d1 is not None and d2 is not None:
+        read_mbs = round((d2.read_bytes - d1.read_bytes) / 1e6 / dt, 3)
+        write_mbs = round((d2.write_bytes - d1.write_bytes) / 1e6 / dt, 3)
+        disk_ok = True
+    else:
+        read_mbs = write_mbs = None
+        disk_ok = False
+
+    dl_mbs = round((n2.bytes_recv - n1.bytes_recv) / 1e6 / dt, 3)
+    ul_mbs = round((n2.bytes_sent - n1.bytes_sent) / 1e6 / dt, 3)
+
+    return {
+        "interval_seconds": interval,
+        "disk": {"available": disk_ok, "read_mbs": read_mbs, "write_mbs": write_mbs},
+        "network": {
+            "download_mbs": dl_mbs,
+            "upload_mbs": ul_mbs,
+            "download_mbps": round(dl_mbs * 8, 3),
+            "upload_mbps": round(ul_mbs * 8, 3),
+        },
+    }
+
+
 def get_top_processes(n: int = 10, sort_by: str = "cpu") -> dict:
     """Return top N processes sorted by cpu or memory."""
+    n = max(1, min(n, 100))
     procs = []
     for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status', 'num_threads']):
         try:
@@ -364,7 +410,7 @@ def _gpu_with_chart():
     fig, ax = plt.subplots(figsize=(7, 3.5))
     ax.bar([i - w for i in x], [g["load_percent"]   for g in gpus], width=w, label="Load %",  color="#3498db")
     ax.bar([i      for i in x], [g["memory_percent"] for g in gpus], width=w, label="VRAM %",  color="#9b59b6")
-    ax.bar([i + w  for i in x], [g["temperature_c"]  for g in gpus], width=w, label="Temp °C", color="#e74c3c")
+    ax.bar([i + w  for i in x], [g.get("temperature_c") or 0  for g in gpus], width=w, label="Temp °C", color="#e74c3c")
     ax.set_xticks(x)
     ax.set_xticklabels([g["name"] for g in gpus], fontsize=8)
     ax.set_ylim(0, 110)
@@ -425,6 +471,52 @@ def get_battery_status() -> dict:
     }
 
 
+def get_temperature_sensors() -> dict:
+    system = platform.system()
+    if system == "Darwin":
+        return {
+            "platform": "macOS",
+            "available": False,
+            "sensors": {},
+            "message": (
+                "psutil cannot access CPU/motherboard sensors on macOS. "
+                "Alternatives: (1) GPU temp via get_gpu_usage if discrete GPU present. "
+                "(2) iStatMenus or HWMonitor for full sensor access. "
+                "(3) On Apple Silicon, thermal throttling shows as current_mhz << max_mhz in get_cpu_usage."
+            ),
+        }
+    if not hasattr(psutil, "sensors_temperatures"):
+        return {
+            "platform": system,
+            "available": False,
+            "sensors": {},
+            "message": "psutil.sensors_temperatures() not available on this platform/version.",
+        }
+    try:
+        raw = psutil.sensors_temperatures()
+    except Exception as e:
+        return {"platform": system, "available": False, "sensors": {}, "message": f"Failed to read sensors: {e}"}
+    if not raw:
+        return {
+            "platform": system,
+            "available": True,
+            "sensors": {},
+            "message": "No sensors detected (may require elevated privileges on Linux).",
+        }
+    sensors = {}
+    for chip, entries in raw.items():
+        sensors[chip] = [
+            {
+                "label": e.label or chip,
+                "current_c": round(e.current, 1) if e.current is not None else None,
+                "high_c": round(e.high, 1) if e.high is not None else None,
+                "critical_c": round(e.critical, 1) if e.critical is not None else None,
+            }
+            for e in entries
+        ]
+    return {"platform": system, "available": True, "message": "", "sensors": sensors}
+
+
 def get_system_uptime() -> dict:
     boot = psutil.boot_time()
     elapsed = int(datetime.datetime.now().timestamp() - boot)
@@ -436,6 +528,77 @@ def get_system_uptime() -> dict:
             "minutes": (elapsed % 3600) // 60,
         },
         "load_avg_1_5_15min": list(psutil.getloadavg()),
+    }
+
+
+def get_system_alerts() -> dict:
+    alerts = []
+
+    def _alert(severity, resource, message, value):
+        alerts.append({"severity": severity, "resource": resource, "message": message, "value": value})
+
+    cpu_pct = psutil.cpu_percent(interval=0.5)
+    if cpu_pct >= 90:
+        _alert("critical", "cpu", f"CPU usage critically high at {cpu_pct}%", cpu_pct)
+    elif cpu_pct >= 75:
+        _alert("warning", "cpu", f"CPU usage elevated at {cpu_pct}%", cpu_pct)
+
+    vm = psutil.virtual_memory()
+    if vm.percent >= 90:
+        _alert("critical", "ram", f"RAM critically high at {vm.percent}%", vm.percent)
+    elif vm.percent >= 75:
+        _alert("warning", "ram", f"RAM elevated at {vm.percent}%", vm.percent)
+
+    try:
+        sw = psutil.swap_memory()
+        if sw.total > 0 and sw.percent >= 80:
+            _alert("warning", "swap", f"Swap high at {sw.percent}% — system may be memory-constrained", sw.percent)
+    except Exception:
+        pass
+
+    for part in psutil.disk_partitions(all=False):
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            if usage.percent >= 95:
+                _alert("critical", f"disk:{part.mountpoint}", f"Disk {part.mountpoint} almost full at {usage.percent}%", usage.percent)
+            elif usage.percent >= 85:
+                _alert("warning", f"disk:{part.mountpoint}", f"Disk {part.mountpoint} getting full at {usage.percent}%", usage.percent)
+        except PermissionError:
+            continue
+
+    if GPU_AVAILABLE:
+        try:
+            for g in GPUtil.getGPUs():
+                load_pct = round(g.load * 100, 1) if g.load is not None else None
+                if load_pct is not None and load_pct >= 95:
+                    _alert("critical", f"gpu:{g.id}", f"GPU {g.name} load critically high at {load_pct}%", load_pct)
+                if g.temperature is not None:
+                    if g.temperature >= 85:
+                        _alert("critical", f"gpu:{g.id}", f"GPU {g.name} temp critically high at {g.temperature}°C", g.temperature)
+                    elif g.temperature >= 75:
+                        _alert("warning", f"gpu:{g.id}", f"GPU {g.name} temp elevated at {g.temperature}°C", g.temperature)
+        except Exception:
+            pass
+
+    batt = psutil.sensors_battery()
+    if batt is not None and not batt.power_plugged and batt.percent <= 10:
+        _alert("critical", "battery", f"Battery critically low at {batt.percent}% and not plugged in", batt.percent)
+
+    has_critical = any(a["severity"] == "critical" for a in alerts)
+    critical_n = sum(1 for a in alerts if a["severity"] == "critical")
+    warning_n = sum(1 for a in alerts if a["severity"] == "warning")
+    if not alerts:
+        summary = "All systems nominal — no alerts detected."
+    elif has_critical:
+        summary = f"{critical_n} critical and {warning_n} warning alert(s) detected. Immediate attention recommended."
+    else:
+        summary = f"{len(alerts)} warning(s) detected. System under stress but not critical."
+
+    return {
+        "alerts": alerts,
+        "alert_count": len(alerts),
+        "has_critical": has_critical,
+        "summary": summary,
     }
 
 
@@ -457,7 +620,102 @@ def get_network_connections() -> dict:
     return {"connections": connections, "total": len(connections)}
 
 
+def get_startup_items() -> dict:
+    system = platform.system()
+
+    if system == "Darwin":
+        scan_dirs = [
+            (pathlib.Path.home() / "Library" / "LaunchAgents", "user"),
+            (pathlib.Path("/Library/LaunchAgents"), "system"),
+            (pathlib.Path("/Library/LaunchDaemons"), "system-daemon"),
+        ]
+        items = []
+        for directory, scope in scan_dirs:
+            if not directory.exists():
+                continue
+            for plist_path in sorted(directory.glob("*.plist")):
+                try:
+                    with open(plist_path, "rb") as f:
+                        data = plistlib.load(f)
+                    prog_args = data.get("ProgramArguments", [])
+                    command = " ".join(str(a) for a in prog_args) if prog_args else data.get("Program", "")
+                    items.append({
+                        "name": data.get("Label") or plist_path.stem,
+                        "command": command,
+                        "path": str(plist_path),
+                        "scope": scope,
+                        "run_at_load": bool(data.get("RunAtLoad", False)),
+                    })
+                except (plistlib.InvalidFileException, OSError, KeyError, TypeError):
+                    items.append({
+                        "name": plist_path.stem,
+                        "command": "",
+                        "path": str(plist_path),
+                        "scope": scope,
+                        "run_at_load": None,
+                        "parse_error": True,
+                    })
+        return {"platform": "macOS", "items": items, "count": len(items)}
+
+    if system == "Windows":
+        try:
+            import winreg
+        except ImportError:
+            return {"platform": "Windows", "error": "winreg not available", "items": [], "count": 0}
+        items = []
+        for hive, reg_path, scope in [
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "user"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", "system"),
+        ]:
+            try:
+                key = winreg.OpenKey(hive, reg_path, 0, winreg.KEY_READ)
+                i = 0
+                while True:
+                    try:
+                        name, value, _ = winreg.EnumValue(key, i)
+                        items.append({"name": name, "command": value, "scope": scope})
+                        i += 1
+                    except OSError:
+                        break
+                winreg.CloseKey(key)
+            except OSError:
+                continue
+        return {"platform": "Windows", "items": items, "count": len(items)}
+
+    if system == "Linux":
+        autostart = pathlib.Path.home() / ".config" / "autostart"
+        items = []
+        if autostart.exists():
+            for dp in sorted(autostart.glob("*.desktop")):
+                try:
+                    text = dp.read_text(encoding="utf-8", errors="replace")
+                    name = ""
+                    command = ""
+                    hidden = False
+                    for line in text.splitlines():
+                        if line.startswith("Name="):
+                            name = line[5:].strip()
+                        elif line.startswith("Exec="):
+                            command = line[5:].strip()
+                        elif line.startswith("Hidden="):
+                            hidden = line[7:].strip().lower() == "true"
+                    items.append({
+                        "name": name or dp.stem,
+                        "command": command,
+                        "path": str(dp),
+                        "scope": "user",
+                        "hidden": hidden,
+                    })
+                except OSError:
+                    continue
+        return {"platform": "Linux", "items": items, "count": len(items)}
+
+    return {"platform": system, "error": f"Not supported on {system}", "items": [], "count": 0}
+
+
 def get_process_details(pid: int) -> dict:
+    if pid <= 0:
+        return {"error": f"Invalid PID {pid}: must be a positive integer"}
     try:
         p = psutil.Process(pid)
         with p.oneshot():
@@ -483,6 +741,14 @@ def get_process_details(pid: int) -> dict:
 
 
 def search_process(name: str) -> dict:
+    if not name or not name.strip():
+        return {
+            "error": "Search query cannot be empty",
+            "query": name,
+            "matches": [],
+            "count": 0,
+        }
+    name = name.strip()
     name_lower = name.lower()
     matches = []
     for p in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status']):
@@ -498,6 +764,48 @@ def search_process(name: str) -> dict:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     return {"query": name, "matches": matches, "count": len(matches)}
+
+
+def kill_process(pid: int, force: bool = False) -> dict:
+    if pid <= 0:
+        return {"success": False, "error": f"Invalid PID {pid}: must be a positive integer"}
+    if pid in _PROTECTED_PIDS:
+        return {"success": False, "error": f"Refusing to kill PID {pid}: protected system process"}
+    try:
+        p = psutil.Process(pid)
+        proc_name = p.name()
+    except psutil.NoSuchProcess:
+        return {"success": False, "error": f"No process with PID {pid}"}
+    except psutil.AccessDenied:
+        return {"success": False, "error": f"Access denied reading PID {pid}"}
+
+    if proc_name.lower() in _PROTECTED_NAMES:
+        return {
+            "success": False,
+            "error": f"Refusing to kill '{proc_name}' (PID {pid}): critical system process",
+        }
+
+    try:
+        if force:
+            p.kill()
+            method = "SIGKILL"
+        else:
+            p.terminate()
+            method = "SIGTERM"
+        return {
+            "success": True,
+            "pid": pid,
+            "name": proc_name,
+            "signal": method,
+            "message": f"Sent {method} to '{proc_name}' (PID {pid})",
+        }
+    except psutil.NoSuchProcess:
+        return {"success": False, "error": f"Process {pid} exited before signal could be sent"}
+    except psutil.AccessDenied:
+        return {
+            "success": False,
+            "error": f"Access denied killing '{proc_name}' (PID {pid}). May require elevated privileges.",
+        }
 
 
 def get_device_specs() -> dict:
@@ -589,6 +897,23 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}, "required": []},
         "fn": lambda _: get_network_usage(),
     },
+    "get_realtime_io": {
+        "description": "Measures actual disk and network I/O throughput by sampling twice over an interval. Returns disk read/write in MB/s and network download/upload in MB/s and Mbps. Call this instead of get_disk_usage or get_network_usage when the user asks about current speed or throughput.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "interval": {
+                    "type": "integer",
+                    "description": "Sampling interval in seconds (1–3). Default 1.",
+                    "default": 1,
+                    "minimum": 1,
+                    "maximum": 3
+                }
+            },
+            "required": []
+        },
+        "fn": lambda args: get_realtime_io(args.get("interval", 1)),
+    },
     "get_top_processes": {
         "description": "Returns the top N resource-hungry processes sorted by CPU or memory usage.",
         "inputSchema": {
@@ -616,15 +941,30 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}, "required": []},
         "fn": lambda _: get_battery_status(),
     },
+    "get_temperature_sensors": {
+        "description": "Returns CPU and motherboard temperature sensor readings. On macOS, returns a helpful message with alternatives (psutil cannot access kernel sensors on Darwin). On Linux/Windows, returns sensor groups with current, high, and critical thresholds.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: get_temperature_sensors(),
+    },
     "get_system_uptime": {
         "description": "Returns how long the system has been running, the last boot time, and the 1/5/15-minute load averages.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
         "fn": lambda _: get_system_uptime(),
     },
+    "get_system_alerts": {
+        "description": "Scans all key system metrics (CPU, RAM, swap, disk partitions, GPU, battery) and returns a prioritized list of critical/warning alerts. Call this first for general 'why is my machine slow?' questions as a quick triage tool.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: get_system_alerts(),
+    },
     "get_network_connections": {
         "description": "Returns all active TCP/UDP connections with local/remote addresses, status, and the owning process name.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
         "fn": lambda _: get_network_connections(),
+    },
+    "get_startup_items": {
+        "description": "Lists applications and services configured to launch automatically at startup/login. macOS: scans ~/Library/LaunchAgents, /Library/LaunchAgents, /Library/LaunchDaemons. Windows: reads Run registry keys. Linux: scans ~/.config/autostart. Use when the user asks what runs at startup or wants to speed up boot times.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: get_startup_items(),
     },
     "get_process_details": {
         "description": "Returns detailed information about a specific process by PID: executable path, command line, user, memory breakdown, open file count, and more.",
@@ -647,6 +987,18 @@ TOOLS = {
             "required": ["name"]
         },
         "fn": lambda args: search_process(args["name"]),
+    },
+    "kill_process": {
+        "description": "Terminates a process by PID. Sends SIGTERM (graceful) by default; SIGKILL if force=True. Refuses to kill critical system processes (PID 1, launchd, systemd, init, kernel_task, core Windows services). Always confirm with the user before calling.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pid": {"type": "integer", "description": "The PID of the process to terminate"},
+                "force": {"type": "boolean", "description": "If true, send SIGKILL (immediate). Default false (SIGTERM, graceful).", "default": False}
+            },
+            "required": ["pid"]
+        },
+        "fn": lambda args: kill_process(args["pid"], args.get("force", False)),
     },
     "get_hardware_profile": {
         "description": "Returns a full hardware profile for a given use-case: specs, live pressure, overclocking capability (where supported), upgrade feasibility per component, and workload-specific bottleneck analysis. Use this when the user asks about speeding up a specific task, upgrading their machine, or overclocking.",
