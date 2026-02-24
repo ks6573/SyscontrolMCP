@@ -1,0 +1,34 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution and build artifacts
+dist/
+build/
+*.egg-info/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment variables
+.env
+.env.*
+
+# IDE and editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# pytest cache
+.pytest_cache/
+
+# mypy cache
+.mypy_cache/

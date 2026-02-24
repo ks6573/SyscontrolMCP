@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "system-monitor": {
-      "command": "/Users/karan/.local/bin/uv",
-      "args": ["run", "/Users/karan/Desktop/SyscontrolMCP/server.py"],
+      "command": "Path-To-Your-UV",
+      "args": ["run", "Path-To-Your-Server"],
       "env": {}
     }
   }
