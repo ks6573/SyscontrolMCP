@@ -264,7 +264,7 @@ def get_disk_usage() -> dict:
                 "free_gb": round(usage.free / 1e9, 2),
                 "percent_used": usage.percent,
             })
-        except PermissionError:
+        except (PermissionError, OSError):
             continue
     io = psutil.disk_io_counters()
     return {
@@ -563,7 +563,7 @@ def get_system_alerts() -> dict:
                 _alert("critical", f"disk:{part.mountpoint}", f"Disk {part.mountpoint} almost full at {usage.percent}%", usage.percent)
             elif usage.percent >= 85:
                 _alert("warning", f"disk:{part.mountpoint}", f"Disk {part.mountpoint} getting full at {usage.percent}%", usage.percent)
-        except PermissionError:
+        except (PermissionError, OSError):
             continue
 
     if GPU_AVAILABLE:
