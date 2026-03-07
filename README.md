@@ -1,6 +1,10 @@
 # SyscontrolMCP
 
-A Model Context Protocol (MCP) server that gives Claude Desktop real-time access to system performance data. Claude can query live CPU, RAM, GPU, disk, network, and process metrics, then provide context-aware optimization advice, hardware upgrade recommendations, and overclocking guidance tailored to your specific workload.
+A Model Context Protocol (MCP) server that gives AI models real-time access to system performance data. Query live CPU, RAM, GPU, disk, network, and process metrics — then get context-aware optimization advice, hardware upgrade recommendations, and overclocking guidance tailored to your specific workload.
+
+Supports two modes:
+- **Agentic terminal agent** (`agent.py`) — conversational CLI powered by a local or cloud LLM
+- **Claude Desktop integration** — connect directly to Claude Desktop via MCP
 
 ---
 
@@ -8,7 +12,7 @@ A Model Context Protocol (MCP) server that gives Claude Desktop real-time access
 
 - Python 3.10 or later
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
-- [Claude Desktop](https://claude.ai/download)
+- [Ollama](https://ollama.com) (for local mode) **or** an Ollama Cloud API key (for cloud mode)
 
 ---
 
@@ -33,7 +37,70 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync
 ```
 
-This installs `psutil`, `gputil`, and `matplotlib` into an isolated virtual environment automatically.
+---
+
+## Agentic Terminal Agent
+
+`agent.py` is a streaming, tool-calling terminal chat interface. At startup it asks you to pick a provider, then enters a conversational REPL where the model autonomously calls the right system tools to answer your questions.
+
+### Quick Start
+
+```bash
+uv run agent.py
+```
+
+You'll be prompted to select a provider:
+
+```
+Select AI model (type cloud or local):
+```
+
+### Local Mode (Ollama)
+
+Requires [Ollama](https://ollama.com) running locally. Pull a model that supports tool calling:
+
+```bash
+ollama pull qwen2.5   # recommended
+ollama serve          # make sure Ollama is running
+```
+
+Then select `local` at the prompt. No API key needed.
+
+**Recommended local models (tool-calling capable):**
+
+| Model | Pull command | Notes |
+|---|---|---|
+| `qwen2.5` | `ollama pull qwen2.5` | Default. Best tool use at 7B |
+| `qwen3:8b` | `ollama pull qwen3:8b` | Newer, adds thinking mode |
+| `llama3.1:8b` | `ollama pull llama3.1:8b` | Battle-tested alternative |
+| `mistral` | `ollama pull mistral` | Lightweight and fast |
+
+> Models that do **not** support tool calling (e.g. `gemma3`) will error. Stick to the list above.
+
+To change the local model, edit line 34 of `agent.py`:
+```python
+LOCAL_MODEL = "qwen2.5"
+```
+
+### Cloud Mode (Ollama Cloud)
+
+Runs `gpt-oss:120b` via [Ollama Cloud](https://ollama.com). Get an API key at [ollama.com/settings/keys](https://ollama.com/settings/keys), then:
+
+```bash
+export OLLAMA_API_KEY=your_key_here
+uv run agent.py
+# → Select AI model (type cloud or local): cloud
+```
+
+### Example Prompts
+
+- `What's eating my CPU right now?`
+- `Give me a full system snapshot`
+- `Which process is using the most memory?`
+- `My mac feels slow — what's going on?`
+- `How much disk space do I have left?`
+- `What's connecting to the internet?`
+- `I'm running Docker and VS Code. How can I optimize RAM usage?`
 
 ---
 
@@ -46,9 +113,7 @@ This installs `psutil`, `gputil`, and `matplotlib` into an isolated virtual envi
 | macOS    | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Windows  | `%APPDATA%\Claude\claude_desktop_config.json` |
 
-**2. Merge the MCP server block**
-
-Open the config file and add the `mcpServers` section. If it already exists, add the `system-monitor` entry inside it:
+**2. Add the MCP server block**
 
 ```json
 {
@@ -62,9 +127,7 @@ Open the config file and add the `mcpServers` section. If it already exists, add
 }
 ```
 
-Replace both paths with the actual absolute paths on your machine. Use `which uv` to find your `uv` binary location.
-
-A pre-filled `claude_desktop_config.json` is included in this repo for reference.
+Replace paths with your actual values. Use `which uv` to find your `uv` binary.
 
 **3. Set the system prompt**
 
@@ -72,17 +135,13 @@ In Claude Desktop, create a new Project and paste the contents of `system_prompt
 
 **4. Restart Claude Desktop**
 
-After restarting, `system-monitor` should appear in the connected MCP servers list.
-
-**5. Test it**
-
-Try: `Give me a full snapshot of my system`
+After restarting, `system-monitor` should appear in the MCP servers list.
 
 ---
 
 ## Tools
 
-The server exposes 14 tools. Claude selects the appropriate one based on your query.
+The server exposes 25 tools. The agent selects the appropriate one based on your query.
 
 ### Live Metrics
 
@@ -123,7 +182,7 @@ The server exposes 14 tools. Claude selects the appropriate one based on your qu
 |------|-------------|
 | `get_hardware_profile` | Comprehensive profile for a stated use-case: hardware specs, live pressure, overclocking capability per platform, per-component upgrade feasibility, and workload-specific bottleneck analysis. |
 
-The `get_hardware_profile` tool understands the following workloads: Lightroom / photo editing, video editing (Premiere, DaVinci Resolve, Final Cut), gaming, 3D rendering (Blender, Maya), compilation and development, Docker / VMs, machine learning, and streaming.
+Supported workloads: Lightroom / photo editing, video editing (Premiere, DaVinci Resolve, Final Cut), gaming, 3D rendering (Blender, Maya), compilation and development, Docker / VMs, machine learning, and streaming.
 
 ---
 
@@ -138,35 +197,6 @@ Overclocking capability is detected automatically based on your hardware and pla
 | Intel K/KF/KS on Windows or Linux | Supported via Intel XTU or BIOS | Supported via MSI Afterburner |
 | AMD Ryzen on Windows or Linux | Supported via Ryzen Master / PBO | Supported via MSI Afterburner |
 
-Claude will never suggest overclocking on platforms where it is not applicable.
-
----
-
-## Example Prompts
-
-- `My computer feels sluggish — what's going on?`
-- `Which processes are eating the most memory right now?`
-- `I want Lightroom exports to be faster. What should I upgrade?`
-- `Can I overclock my CPU for better gaming performance?`
-- `I'm a developer running Docker and VS Code. How can I optimize my RAM usage?`
-- `What's connecting to the internet right now?`
-- `Give me a full snapshot of my system and tell me what needs attention.`
-- `How much disk space do I have left and what's using it?`
-
----
-
-## Testing Locally
-
-A `client.py` test harness is included for testing the server without Claude Desktop:
-
-```bash
-# Interactive mode — select a tool from a menu
-uv run client.py
-
-# Immediate full snapshot
-uv run client.py --snapshot
-```
-
 ---
 
 ## Project Structure
@@ -174,6 +204,7 @@ uv run client.py --snapshot
 ```
 SyscontrolMCP/
 ├── server.py                  # MCP server — all tools and protocol handling
+├── agent.py                   # Agentic terminal chat interface (local or cloud LLM)
 ├── client.py                  # Local test client
 ├── pyproject.toml             # Project metadata and dependencies (uv)
 ├── uv.lock                    # Pinned dependency versions
@@ -190,3 +221,4 @@ SyscontrolMCP/
 | psutil | >= 5.9.0 | System metrics (CPU, RAM, disk, network, processes) |
 | gputil | >= 1.4.0 | GPU metrics (optional — gracefully disabled if absent) |
 | matplotlib | >= 3.7.0 | Inline chart generation for CPU, RAM, and GPU tools |
+| openai | >= 1.0.0 | OpenAI-compatible client for Ollama local and cloud |

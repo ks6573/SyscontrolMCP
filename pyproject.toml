@@ -6,4 +6,6 @@ dependencies = [
     "psutil>=5.9.0",
     "gputil>=1.4.0",
     "matplotlib>=3.7.0",
+    "anthropic>=0.50.0",
+    "openai>=2.26.0",
 ]
