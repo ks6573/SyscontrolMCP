@@ -158,6 +158,16 @@ _PROTECTED_NAMES = frozenset({
     "smss.exe", "wininit.exe", "lsass.exe", "services.exe",
 })
 
+# Directories skipped by find_large_files — defined once at module level
+# so the set is not re-created on every call.
+_FIND_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".Trash", "Library",
+})
+
+# FedEx tracking numbers are exactly 12, 15, or 22 digits.
+_FEDEX_RE = re.compile(r"^\d{12}$|^\d{15}$|^\d{22}$")
+
 
 def _detect_cpu_oc(cpu_brand: str, system: str, machine: str) -> dict:
     if machine == "arm64" and system == "Darwin":
@@ -534,10 +544,17 @@ def _gpu_with_chart():
 
 def get_hardware_profile(use_case: str = "") -> dict:
     """Aggregate hardware specs, live pressure, OC capability, upgrade feasibility, and use-case bottleneck analysis."""
-    specs     = get_device_specs()
-    cpu_live  = get_cpu_usage()
-    ram_live  = get_ram_usage()
-    gpu_data  = get_gpu_usage()
+    from concurrent.futures import ThreadPoolExecutor
+    # Run all four independent data-source calls in parallel.
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        f_specs = ex.submit(get_device_specs)
+        f_cpu   = ex.submit(get_cpu_usage)
+        f_ram   = ex.submit(get_ram_usage)
+        f_gpu   = ex.submit(get_gpu_usage)
+    specs    = f_specs.result()
+    cpu_live = f_cpu.result()
+    ram_live = f_ram.result()
+    gpu_data = f_gpu.result()
 
     system    = specs["os"]["system"]
     machine   = specs["os"]["machine"]
@@ -718,20 +735,27 @@ def get_network_connections() -> dict:
         raw_connections = psutil.net_connections(kind="inet")
     except psutil.AccessDenied:
         return {"error": "Access denied. Network connection listing may require elevated privileges.", "connections": [], "total": 0}
-    connections = []
-    for conn in raw_connections:
+
+    # Build a PID→name map once from process_iter instead of constructing
+    # a new psutil.Process object for every connection (O(n) not O(n·k)).
+    pid_to_name: dict[int, str] = {}
+    for p in psutil.process_iter(["pid", "name"]):
         try:
-            proc_name = psutil.Process(conn.pid).name() if conn.pid else None
+            pid_to_name[p.info["pid"]] = p.info["name"] or ""
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            proc_name = None
-        connections.append({
-            "proto": "tcp" if conn.type == socket.SOCK_STREAM else "udp",
-            "local": f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else None,
-            "remote": f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else None,
-            "status": conn.status,
-            "pid": conn.pid,
-            "process": proc_name,
-        })
+            pass
+
+    connections = [
+        {
+            "proto":   "tcp" if conn.type == socket.SOCK_STREAM else "udp",
+            "local":   f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else None,
+            "remote":  f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else None,
+            "status":  conn.status,
+            "pid":     conn.pid,
+            "process": pid_to_name.get(conn.pid) if conn.pid else None,
+        }
+        for conn in raw_connections
+    ]
     return {"connections": connections, "total": len(connections)}
 
 
@@ -975,15 +999,24 @@ def get_device_specs() -> dict:
 
 
 def get_full_snapshot() -> dict:
-    """Aggregate snapshot of all metrics."""
+    """Aggregate snapshot of all metrics — all sources fetched in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        f_cpu     = ex.submit(get_cpu_usage)
+        f_ram     = ex.submit(get_ram_usage)
+        f_gpu     = ex.submit(get_gpu_usage)
+        f_disk    = ex.submit(get_disk_usage)
+        f_net     = ex.submit(get_network_usage)
+        f_top_cpu = ex.submit(get_top_processes, 5, "cpu")
+        f_top_mem = ex.submit(get_top_processes, 5, "memory")
     return {
-        "cpu": get_cpu_usage(),
-        "ram": get_ram_usage(),
-        "gpu": get_gpu_usage(),
-        "disk": get_disk_usage(),
-        "network": get_network_usage(),
-        "top_processes_by_cpu": get_top_processes(5, "cpu")["top_processes"],
-        "top_processes_by_memory": get_top_processes(5, "memory")["top_processes"],
+        "cpu":                    f_cpu.result(),
+        "ram":                    f_ram.result(),
+        "gpu":                    f_gpu.result(),
+        "disk":                   f_disk.result(),
+        "network":                f_net.result(),
+        "top_processes_by_cpu":    f_top_cpu.result()["top_processes"],
+        "top_processes_by_memory": f_top_mem.result()["top_processes"],
     }
 
 
@@ -1276,9 +1309,13 @@ def check_app_updates() -> dict:
         "errors": [],
         "summary": "",
     }
+    lock = threading.Lock()
 
-    # Homebrew
-    if shutil.which("brew"):
+    def _brew():
+        if not shutil.which("brew"):
+            with lock:
+                results["errors"].append("Homebrew not installed — install from https://brew.sh")
+            return
         try:
             proc = subprocess.run(
                 ["brew", "outdated", "--json=v2"],
@@ -1287,7 +1324,7 @@ def check_app_updates() -> dict:
             )
             if proc.returncode in (0, 1) and proc.stdout.strip():
                 data = json.loads(proc.stdout)
-                results["brew_formulae"] = [
+                formulae = [
                     {
                         "name": f["name"],
                         "installed": f["installed_versions"][0] if f.get("installed_versions") else "?",
@@ -1295,7 +1332,7 @@ def check_app_updates() -> dict:
                     }
                     for f in data.get("formulae", [])
                 ]
-                results["brew_casks"] = [
+                casks = [
                     {
                         "name": c["name"],
                         "installed": c.get("installed_versions", ["?"])[0],
@@ -1303,41 +1340,52 @@ def check_app_updates() -> dict:
                     }
                     for c in data.get("casks", [])
                 ]
+                with lock:
+                    results["brew_formulae"] = formulae
+                    results["brew_casks"]    = casks
             elif proc.returncode not in (0, 1):
-                results["errors"].append(f"brew error: {proc.stderr.strip()[:200]}")
+                with lock:
+                    results["errors"].append(f"brew error: {proc.stderr.strip()[:200]}")
         except subprocess.TimeoutExpired:
-            results["errors"].append("brew outdated timed out (>120s)")
+            with lock:
+                results["errors"].append("brew outdated timed out (>120s)")
         except (json.JSONDecodeError, OSError) as e:
-            results["errors"].append(f"brew parse error: {str(e)}")
-    else:
-        results["errors"].append("Homebrew not installed — install from https://brew.sh")
+            with lock:
+                results["errors"].append(f"brew parse error: {str(e)}")
 
-    # Mac App Store (requires `mas` CLI)
-    if shutil.which("mas"):
+    def _mas():
+        if not shutil.which("mas"):
+            with lock:
+                results["errors"].append(
+                    "mas not installed — install with 'brew install mas' to check App Store updates"
+                )
+            return
         try:
             proc = subprocess.run(
                 ["mas", "outdated"],
                 capture_output=True, text=True, timeout=60,
             )
+            apps = []
             for line in proc.stdout.splitlines():
                 m = re.match(r"(\d+)\s+(.+?)\s+\((.+?)\)", line.strip())
                 if m:
-                    results["mac_app_store"].append({
+                    apps.append({
                         "app_id": m.group(1),
-                        "name": m.group(2).strip(),
+                        "name":   m.group(2).strip(),
                         "available_version": m.group(3),
                     })
+            with lock:
+                results["mac_app_store"] = apps
         except subprocess.TimeoutExpired:
-            results["errors"].append("mas outdated timed out (>60s)")
+            with lock:
+                results["errors"].append("mas outdated timed out (>60s)")
         except OSError as e:
-            results["errors"].append(f"mas error: {str(e)}")
-    else:
-        results["errors"].append(
-            "mas not installed — install with 'brew install mas' to check App Store updates"
-        )
+            with lock:
+                results["errors"].append(f"mas error: {str(e)}")
 
-    # macOS system updates
-    if shutil.which("softwareupdate"):
+    def _sysupdate():
+        if not shutil.which("softwareupdate"):
+            return
         try:
             proc = subprocess.run(
                 ["softwareupdate", "-l"],
@@ -1345,6 +1393,7 @@ def check_app_updates() -> dict:
             )
             combined = proc.stdout + proc.stderr
             current_label = None
+            updates = []
             for line in combined.splitlines():
                 stripped = line.strip()
                 if stripped.startswith("* Label:"):
@@ -1352,16 +1401,31 @@ def check_app_updates() -> dict:
                 elif current_label and "Title:" in stripped:
                     m = re.search(r"Title:\s*(.+?),\s*Version:\s*([\d.]+)", stripped)
                     if m:
-                        results["system_updates"].append({
-                            "label": current_label,
-                            "title": m.group(1).strip(),
+                        updates.append({
+                            "label":   current_label,
+                            "title":   m.group(1).strip(),
                             "version": m.group(2),
                         })
                     current_label = None
+            with lock:
+                results["system_updates"] = updates
         except subprocess.TimeoutExpired:
-            results["errors"].append("softwareupdate timed out (>60s)")
+            with lock:
+                results["errors"].append("softwareupdate timed out (>60s)")
         except OSError as e:
-            results["errors"].append(f"softwareupdate error: {str(e)}")
+            with lock:
+                results["errors"].append(f"softwareupdate error: {str(e)}")
+
+    # Run all three checks concurrently — brew alone can take 30–120s.
+    threads = [
+        threading.Thread(target=_brew,      daemon=True),
+        threading.Thread(target=_mas,       daemon=True),
+        threading.Thread(target=_sysupdate, daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=130)   # brew timeout is 120s; add a small buffer
 
     total = (
         len(results["brew_formulae"]) + len(results["brew_casks"])
@@ -1392,26 +1456,14 @@ def check_app_updates() -> dict:
 
 def _detect_carrier(tn: str) -> str:
     tn = re.sub(r"\s+", "", tn).upper()
-    if tn.startswith("TBA"):
-        return "amazon_logistics"
-    if re.match(r"^1Z[A-Z0-9]{16}$", tn):
-        return "ups"
-    if re.match(r"^(94|93|92|91|90)\d{18,20}$", tn):
-        return "usps"
-    if re.match(r"^[A-Z]{2}\d{9}[A-Z]{2}$", tn):
-        return "usps"
-    if re.match(r"^\d{12}$", tn):
-        return "fedex"
-    if re.match(r"^\d{15}$", tn):
-        return "fedex"
-    if re.match(r"^\d{22}$", tn):
-        return "fedex"
-    if re.match(r"^\d{20,21}$", tn):
-        return "usps"
-    if re.match(r"^\d{10,11}$", tn):
-        return "dhl"
-    if re.match(r"^(JD|GM)\d{14,20}$", tn):
-        return "dhl"
+    if tn.startswith("TBA"):                           return "amazon_logistics"
+    if re.match(r"^1Z[A-Z0-9]{16}$", tn):             return "ups"
+    if re.match(r"^(94|93|92|91|90)\d{18,20}$", tn): return "usps"
+    if re.match(r"^[A-Z]{2}\d{9}[A-Z]{2}$", tn):     return "usps"
+    if _FEDEX_RE.match(tn):                            return "fedex"   # 12, 15, or 22 digits
+    if re.match(r"^\d{20,21}$", tn):                  return "usps"
+    if re.match(r"^\d{10,11}$", tn):                  return "dhl"
+    if re.match(r"^(JD|GM)\d{14,20}$", tn):           return "dhl"
     return "unknown"
 
 
@@ -1508,6 +1560,360 @@ def track_package(tracking_number: str) -> dict:
         return {"tracking_number": tracking_number, "error": f"Network error: {str(e)}"}
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         return {"tracking_number": tracking_number, "error": f"Failed to parse tracking response: {str(e)}"}
+
+
+# ── New tool implementations ──────────────────────────────────────────────────
+
+def find_large_files(path: str = "", n: int = 10) -> dict:
+    """Find the top N largest files under path (default: home directory)."""
+    root = pathlib.Path(path).expanduser().resolve() if path else pathlib.Path.home()
+    if not root.exists():
+        return {"error": f"Path '{path}' does not exist."}
+    if not root.is_dir():
+        return {"error": f"'{path}' is not a directory."}
+
+    files: list[tuple[int, str]] = []
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root, onerror=None):
+        # Prune noisy / hidden dirs in-place so os.walk skips them entirely.
+        # Uses the module-level _FIND_SKIP_DIRS constant (not recreated per call).
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _FIND_SKIP_DIRS and not d.startswith(".")
+        ]
+        for fname in filenames:
+            fpath = pathlib.Path(dirpath) / fname
+            try:
+                sz = fpath.stat().st_size
+                files.append((sz, str(fpath)))
+                scanned += 1
+            except OSError:
+                continue
+
+    files.sort(reverse=True)
+    top = files[:n]
+
+    return {
+        "search_root": str(root),
+        "files_scanned": scanned,
+        "top_files": [
+            {"path": p, "size_mb": round(s / 1e6, 2), "size_bytes": s}
+            for s, p in top
+        ],
+    }
+
+
+def network_latency_check() -> dict:
+    """
+    Pings the local gateway, Cloudflare (1.1.1.1), and Google DNS (8.8.8.8)
+    CONCURRENTLY using threads, then diagnoses where latency is introduced.
+    Async: YES — all pings run in parallel via threading.
+    """
+    # Discover default gateway
+    gateway: str | None = None
+    try:
+        nr = subprocess.run(["netstat", "-nr"], capture_output=True, text=True, timeout=5)
+        for line in nr.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[0] in ("default", "0.0.0.0") and len(parts) >= 2:
+                gateway = parts[1]
+                break
+    except Exception:
+        pass
+
+    targets: dict[str, str] = {}
+    if gateway:
+        targets["gateway"] = gateway
+    targets["cloudflare_dns"] = "1.1.1.1"
+    targets["google_dns"]     = "8.8.8.8"
+    targets["cloudflare.com"] = "cloudflare.com"
+
+    results: dict = {}
+    lock = threading.Lock()
+    _sys = platform.system()
+
+    def _ping(label: str, host: str) -> None:
+        try:
+            cmd = (
+                ["ping", "-n", "4", "-w", "2000", host]
+                if _sys == "Windows"
+                else ["ping", "-c", "4", "-W", "2", host]
+            )
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            out  = proc.stdout + proc.stderr
+
+            avg_ms: float | None = None
+            # macOS/Linux: min/avg/max/stddev = x/y/z/w ms
+            m = re.search(r"min/avg/max(?:/(?:mdev|stddev))?\s*=\s*[\d.]+/([\d.]+)/", out)
+            if m:
+                avg_ms = float(m.group(1))
+            # Windows: Average = Xms
+            if avg_ms is None:
+                m = re.search(r"Average\s*=\s*([\d.]+)\s*ms", out, re.I)
+                if m:
+                    avg_ms = float(m.group(1))
+
+            with lock:
+                results[label] = {
+                    "host":            host,
+                    "reachable":       proc.returncode == 0,
+                    "avg_latency_ms":  avg_ms,
+                }
+        except subprocess.TimeoutExpired:
+            with lock:
+                results[label] = {"host": host, "reachable": False, "error": "ping timed out"}
+        except Exception as exc:
+            with lock:
+                results[label] = {"host": host, "reachable": False, "error": str(exc)}
+
+    threads = [threading.Thread(target=_ping, args=(lbl, h), daemon=True)
+               for lbl, h in targets.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    # Diagnosis
+    gw = results.get("gateway",       {})
+    cf = results.get("cloudflare_dns", {})
+    gd = results.get("google_dns",    {})
+    diagnosis: list[str] = []
+    if gateway and not gw.get("reachable"):
+        diagnosis.append("Cannot reach your local gateway — likely a router/Wi-Fi issue.")
+    elif not cf.get("reachable") and not gd.get("reachable"):
+        diagnosis.append("Gateway reachable but public DNS is not — likely an ISP or WAN issue.")
+    else:
+        lat = cf.get("avg_latency_ms") or gd.get("avg_latency_ms")
+        if lat and lat > 100:
+            diagnosis.append(f"High latency ({lat} ms) to public DNS — possible ISP congestion.")
+        elif lat and lat > 50:
+            diagnosis.append(f"Moderate latency ({lat} ms) — network is functional but not ideal.")
+        else:
+            diagnosis.append("Network connectivity looks normal.")
+
+    return {"targets": results, "diagnosis": diagnosis}
+
+
+def get_docker_status() -> dict:
+    """Return running Docker containers with CPU and memory stats."""
+    if not shutil.which("docker"):
+        return {"error": "Docker is not installed or not in PATH."}
+
+    try:
+        ping = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if ping.returncode != 0:
+            return {"error": "Docker daemon is not running. Start Docker Desktop first."}
+        server_version = ping.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return {"error": "Docker daemon did not respond in time."}
+
+    try:
+        ps = subprocess.run(
+            ["docker", "ps", "--format",
+             "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        containers: list[dict] = []
+        for line in ps.stdout.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 4:
+                containers.append({
+                    "id":     parts[0],
+                    "name":   parts[1],
+                    "image":  parts[2],
+                    "status": parts[3],
+                    "ports":  parts[4] if len(parts) > 4 else "",
+                })
+
+        # One-shot stats (no-stream)
+        if containers:
+            stats = subprocess.run(
+                ["docker", "stats", "--no-stream", "--format",
+                 "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"],
+                capture_output=True, text=True, timeout=20,
+            )
+            stat_map: dict[str, dict] = {}
+            for line in stats.stdout.strip().splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 4:
+                    stat_map[parts[0]] = {
+                        "cpu_percent":     parts[1],
+                        "memory_usage":    parts[2],
+                        "memory_percent":  parts[3],
+                    }
+            for c in containers:
+                c.update(stat_map.get(c["name"], {}))
+
+        # Total container count (including stopped)
+        all_ps = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Status}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        total = len(all_ps.stdout.strip().splitlines()) if all_ps.stdout.strip() else 0
+
+        return {
+            "docker_version":      server_version,
+            "running_count":       len(containers),
+            "total_containers":    total,
+            "running_containers":  containers,
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": "Docker command timed out."}
+    except Exception as exc:
+        return {"error": f"Failed to query Docker: {exc}"}
+
+
+def get_time_machine_status() -> dict:
+    """
+    Return macOS Time Machine backup status, last backup time, and destination.
+    Async: YES — tmutil status, latestbackup, and destinationinfo run in parallel.
+    """
+    if platform.system() != "Darwin":
+        return {"error": "Time Machine is macOS-only."}
+    if not shutil.which("tmutil"):
+        return {"error": "tmutil not found."}
+
+    result: dict = {}
+    lock = threading.Lock()
+
+    def _status() -> None:
+        try:
+            proc = subprocess.run(["tmutil", "status"], capture_output=True,
+                                  text=True, timeout=10)
+            out = proc.stdout
+            data: dict = {"running": "Running = 1" in out}
+            m = re.search(r'BackupPhase\s*=\s*"?([^";\n]+)"?', out)
+            if m:
+                data["phase"] = m.group(1).strip()
+            m = re.search(r'Percent\s*=\s*([\d.]+)', out)
+            if m:
+                data["progress_percent"] = round(float(m.group(1)) * 100, 1)
+            m = re.search(r'_raw_Percent\s*=\s*([\d.]+)', out)
+            if m:
+                data["progress_percent"] = round(float(m.group(1)) * 100, 1)
+            with lock:
+                result.update(data)
+        except Exception as exc:
+            with lock:
+                result["status_error"] = str(exc)
+
+    def _latest() -> None:
+        try:
+            proc = subprocess.run(["tmutil", "latestbackup"], capture_output=True,
+                                  text=True, timeout=10)
+            bp = proc.stdout.strip()
+            if bp and "No backups" not in bp:
+                with lock:
+                    result["last_backup_path"] = bp
+                m = re.search(r"(\d{4}-\d{2}-\d{2}-\d{6})", bp)
+                if m:
+                    try:
+                        dt = datetime.datetime.strptime(m.group(1), "%Y-%m-%d-%H%M%S")
+                        delta = datetime.datetime.now() - dt
+                        hours = int(delta.total_seconds() // 3600)
+                        age = f"{hours} hours ago" if hours < 48 else f"{delta.days} days ago"
+                        with lock:
+                            result["last_backup"] = dt.isoformat()
+                            result["last_backup_age"] = age
+                    except ValueError:
+                        with lock:
+                            result["last_backup"] = m.group(1)
+            else:
+                with lock:
+                    result["last_backup"] = "No backups found"
+        except Exception as exc:
+            with lock:
+                result["last_backup_error"] = str(exc)
+
+    def _dest() -> None:
+        try:
+            proc = subprocess.run(["tmutil", "destinationinfo"], capture_output=True,
+                                  text=True, timeout=10)
+            m = re.search(r"Name\s*:\s*(.+)", proc.stdout)
+            if m:
+                with lock:
+                    result["destination"] = m.group(1).strip()
+            m = re.search(r"Kind\s*:\s*(.+)", proc.stdout)
+            if m:
+                with lock:
+                    result["destination_kind"] = m.group(1).strip()
+        except Exception:
+            pass
+
+    threads = [
+        threading.Thread(target=_status, daemon=True),
+        threading.Thread(target=_latest, daemon=True),
+        threading.Thread(target=_dest,   daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    return result
+
+
+def tail_system_logs(lines: int = 50, filter_str: str = "") -> dict:
+    """Tail recent system logs. macOS: unified log (last 5 min). Linux: journalctl."""
+    lines  = max(10, min(lines, 500))
+    system = platform.system()
+
+    if system == "Darwin":
+        cmd = ["log", "show", "--last", "5m", "--style", "compact"]
+        if filter_str:
+            cmd += ["--predicate", f'eventMessage CONTAINS[c] "{filter_str}"']
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            all_lines = [l for l in proc.stdout.splitlines() if l.strip()]
+            tail = all_lines[-lines:]
+            return {
+                "platform": "macOS",
+                "source":   "unified system log (last 5 minutes)",
+                "filter":   filter_str or None,
+                "line_count": len(tail),
+                "lines":    tail,
+            }
+        except subprocess.TimeoutExpired:
+            return {"error": "Log command timed out — try reducing lines or adding a filter."}
+        except Exception as exc:
+            return {"error": f"Failed to read logs: {exc}"}
+
+    if system == "Linux":
+        if shutil.which("journalctl"):
+            cmd = ["journalctl", "-n", str(lines), "--no-pager", "-o", "short"]
+            if filter_str:
+                cmd += ["-g", filter_str]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                log_lines = proc.stdout.splitlines()
+                return {
+                    "platform": "Linux", "source": "journalctl",
+                    "filter": filter_str or None,
+                    "line_count": len(log_lines), "lines": log_lines,
+                }
+            except Exception as exc:
+                return {"error": f"journalctl failed: {exc}"}
+        syslog = pathlib.Path("/var/log/syslog")
+        if syslog.exists():
+            try:
+                all_lines = syslog.read_text(errors="replace").splitlines()
+                tail = [
+                    l for l in all_lines
+                    if not filter_str or filter_str.lower() in l.lower()
+                ][-lines:]
+                return {
+                    "platform": "Linux", "source": "/var/log/syslog",
+                    "filter": filter_str or None,
+                    "line_count": len(tail), "lines": tail,
+                }
+            except PermissionError:
+                return {"error": "Permission denied reading /var/log/syslog. Try sudo."}
+        return {"error": "No supported log source found (journalctl or /var/log/syslog)."}
+
+    return {"error": f"tail_system_logs is not supported on {system}."}
 
 
 # ── Tool registry ─────────────────────────────────────────────────────────────
@@ -1751,6 +2157,84 @@ TOOLS = {
             "required": ["tracking_number"],
         },
         "fn": lambda args: track_package(args["tracking_number"]),
+    },
+    "find_large_files": {
+        "description": (
+            "Finds the top N largest files under a given directory path (default: home directory). "
+            "Skips hidden directories, .git, __pycache__, node_modules, .venv, and Library. "
+            "Use when the user asks what is using disk space or wants to free up storage."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to search (e.g. '/Users/you/Downloads'). Defaults to home directory if omitted.",
+                    "default": "",
+                },
+                "n": {
+                    "type": "integer",
+                    "description": "Number of largest files to return (default 10, max 50).",
+                    "default": 10,
+                },
+            },
+            "required": [],
+        },
+        "fn": lambda args: find_large_files(args.get("path", ""), args.get("n", 10)),
+    },
+    "network_latency_check": {
+        "description": (
+            "Pings the local gateway, Cloudflare DNS (1.1.1.1), and Google DNS (8.8.8.8) "
+            "concurrently and returns per-target latency and reachability. "
+            "Includes an automatic diagnosis (router issue / ISP issue / congestion / normal). "
+            "Use when the user asks if their internet is slow or to locate where latency is introduced."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: network_latency_check(),
+    },
+    "get_docker_status": {
+        "description": (
+            "Returns all running Docker containers with their CPU%, memory usage, image, status, and ports. "
+            "Also reports total container count (including stopped). "
+            "Returns an actionable error if Docker is not installed or the daemon is not running."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: get_docker_status(),
+    },
+    "get_time_machine_status": {
+        "description": (
+            "macOS only. Returns Time Machine backup status: whether a backup is currently running, "
+            "last backup time and how long ago it was, backup destination name and kind. "
+            "Uses tmutil status, latestbackup, and destinationinfo (run in parallel)."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: get_time_machine_status(),
+    },
+    "tail_system_logs": {
+        "description": (
+            "Returns the last N lines from the system log. "
+            "macOS: reads from the unified system log (last 5 minutes) via `log show`. "
+            "Linux: reads from journalctl or /var/log/syslog. "
+            "Optional filter_str narrows results to lines containing that keyword. "
+            "Use to diagnose crashes, kernel panics, or application errors."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "lines": {
+                    "type": "integer",
+                    "description": "Number of log lines to return (default 50, max 500).",
+                    "default": 50,
+                },
+                "filter_str": {
+                    "type": "string",
+                    "description": "Optional keyword to filter log lines (case-insensitive).",
+                    "default": "",
+                },
+            },
+            "required": [],
+        },
+        "fn": lambda args: tail_system_logs(args.get("lines", 50), args.get("filter_str", "")),
     },
 }
 

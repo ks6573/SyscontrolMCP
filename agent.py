@@ -146,9 +146,19 @@ class MCPClientPool:
         self._pool_lock = threading.Lock()
 
     def _get_or_create(self, index: int) -> MCPClient:
+        # Check under lock — if we already have enough clients, return immediately.
         with self._pool_lock:
+            if len(self._clients) > index:
+                return self._clients[index]
+        # Construct the new client OUTSIDE the lock — MCPClient.__init__ spawns
+        # a subprocess and runs the MCP handshake, which can take 100–200 ms.
+        # Holding the lock for that entire time would block every other thread.
+        new_client = MCPClient()
+        with self._pool_lock:
+            # Another thread may have raced us; only append if still needed.
             while len(self._clients) <= index:
-                self._clients.append(MCPClient())
+                self._clients.append(new_client)
+                return self._clients[index]
         return self._clients[index]
 
     def call_tools_parallel(
