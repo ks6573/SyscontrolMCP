@@ -53,6 +53,8 @@ _REMINDER_DIR  = pathlib.Path.home() / ".syscontrol"
 _REMINDER_FILE = _REMINDER_DIR / "reminders.json"
 # Create the config directory once at server startup, not on every read/write.
 _REMINDER_DIR.mkdir(parents=True, exist_ok=True)
+_REMINDER_START_LOCK = threading.Lock()
+_REMINDER_STARTED = False
 
 
 def _load_reminders() -> list:
@@ -143,6 +145,16 @@ class ReminderChecker:
                     f.write(f"[{ts}] _fire exception: {exc}\n")
             except Exception:
                 pass
+
+
+def _start_reminder_checker_once() -> None:
+    """Start the reminder checker for this process if it is not already running."""
+    global _REMINDER_STARTED
+    with _REMINDER_START_LOCK:
+        if _REMINDER_STARTED:
+            return
+        ReminderChecker().start()
+        _REMINDER_STARTED = True
 
 
 # ── MCP helpers ──────────────────────────────────────────────────────────────
@@ -2711,6 +2723,7 @@ def handle_request(request: dict) -> dict | None:
 # ── stdio transport loop ──────────────────────────────────────────────────────
 
 def main():
+    _start_reminder_checker_once()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -2735,6 +2748,4 @@ def main():
 
 
 if __name__ == "__main__":
-    _reminder_checker = ReminderChecker()
-    _reminder_checker.start()
     main()
