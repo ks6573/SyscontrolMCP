@@ -27,7 +27,7 @@ Three ways to run it:
 ```bash
 # 1. Clone
 git clone https://github.com/ks6573/SysControl.git
-cd SyscontrolMCP
+cd SysControl
 
 # 2. Install uv (skip if already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
