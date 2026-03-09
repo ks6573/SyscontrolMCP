@@ -4,6 +4,7 @@ MCP Server: System Activity Monitor
 Exposes tools for querying CPU, RAM, GPU, disk, network, and process info.
 """
 
+import ast
 import base64
 import datetime
 import io
@@ -62,6 +63,15 @@ _REMINDER_DIR  = pathlib.Path.home() / ".syscontrol"
 _REMINDER_FILE = _REMINDER_DIR / "reminders.json"
 # Create the config directory once at server startup, not on every read/write.
 _REMINDER_DIR.mkdir(parents=True, exist_ok=True)
+
+# ── Tool self-extension constants ─────────────────────────────────────────────
+# Path to this file — used by create_tool for self-modification.
+_SERVER_FILE = pathlib.Path(__file__)
+_PROMPT_FILE = pathlib.Path(__file__).parent / "prompt.json"
+# Marker prepended to each user-defined function block in this file.
+_USER_TOOL_FN_MARKER  = "# ── User-Defined Tool:"
+# Anchor comment inside the TOOLS dict where new entries are inserted.
+_USER_TOOL_REG_MARKER = "# ── User-Defined Tools (registry) ──────────────────────────────────────────"
 _REMINDER_START_LOCK = threading.Lock()
 _REMINDER_STARTED = False
 
@@ -3179,6 +3189,175 @@ def eject_disk(mountpoint: str) -> dict:
         return {"error": str(e)}
 
 
+# ── Tool self-extension ────────────────────────────────────────────────────────
+
+def list_user_tools() -> dict:
+    """Return all user-installed tools (created via create_tool)."""
+    text  = _SERVER_FILE.read_text()
+    names = [
+        line.split(_USER_TOOL_FN_MARKER)[1].strip().rstrip("─").strip()
+        for line in text.splitlines()
+        # Only count actual comment lines, not the constant definition itself
+        if line.strip().startswith(_USER_TOOL_FN_MARKER)
+    ]
+    return {
+        "count":      len(names),
+        "user_tools": names,
+        "note":       "Restart the agent (syscontrol) for installed tools to appear.",
+    }
+
+
+def create_tool(
+    name:               str,
+    description:        str,
+    parameters_schema:  dict | None,
+    implementation:     str,
+    prompt_doc:         str = "",
+) -> dict:
+    """
+    Generate, validate, and install a new MCP tool into server.py.
+
+    Requires allow_tool_creation: true in ~/.syscontrol/config.json.
+    """
+    # ── Permission gate ────────────────────────────────────────────────────────
+    denied = _permission_check("allow_tool_creation", "create_tool")
+    if denied:
+        return denied
+
+    # ── Input validation ───────────────────────────────────────────────────────
+    import re as _re
+    if not name or not _re.match(r"^[a-z][a-z0-9_]*$", name):
+        return {
+            "error": (
+                "Tool name must start with a lowercase letter and contain only "
+                "lowercase letters, digits, and underscores (e.g. 'get_spotify_track')."
+            )
+        }
+
+    server_text = _SERVER_FILE.read_text()
+    if f'"{name}":' in server_text:
+        return {"error": f"A tool named '{name}' already exists. Choose a different name."}
+
+    if not description.strip():
+        return {"error": "description is required."}
+    if not implementation.strip():
+        return {"error": "implementation is required."}
+
+    # ── Syntax validation ──────────────────────────────────────────────────────
+    try:
+        tree = ast.parse(implementation)
+    except SyntaxError as exc:
+        return {"error": f"Syntax error in implementation: {exc}"}
+
+    # ── Extract function info from AST ─────────────────────────────────────────
+    func_defs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    if not func_defs:
+        return {"error": "implementation must define at least one function (def ...)."}
+    func_name   = func_defs[0].name
+    func_params = [a.arg for a in func_defs[0].args.args if a.arg != "self"]
+
+    # ── Security scan (non-blocking — warns but does not block) ───────────────
+    _DANGEROUS = ["eval(", "exec(", "__import__(", "compile(", "os.system("]
+    security_warnings = [d for d in _DANGEROUS if d in implementation]
+
+    # ── Build fn lambda ────────────────────────────────────────────────────────
+    if func_params:
+        param_str = ", ".join(f'args.get("{p}")' for p in func_params)
+        fn_lambda = f"lambda args: {func_name}({param_str})"
+    else:
+        fn_lambda = f"lambda _: {func_name}()"
+
+    # ── Build schema ───────────────────────────────────────────────────────────
+    schema = parameters_schema or {"type": "object", "properties": {}, "required": []}
+    # Inline schema on one line for clean source output
+    schema_str = json.dumps(schema)
+
+    # ── Insert function into server.py (before the TOOLS dict) ──────────────────
+    fn_section = (
+        f"\n\n{_USER_TOOL_FN_MARKER} {name} "
+        + "\u2500" * max(1, 74 - len(name))
+        + f"\n\n{implementation.rstrip()}\n"
+    )
+    # Use "\nTOOLS = {" as the insertion anchor — it is unique in the file and
+    # does not appear in any error message strings within this function.
+    tools_dict_start = "\nTOOLS = {"
+    if tools_dict_start not in server_text:
+        return {"error": "Could not locate 'TOOLS = {' in server.py. The file may be malformed."}
+    server_text = server_text.replace(tools_dict_start, fn_section + tools_dict_start, 1)
+
+    # ── Insert TOOLS entry before the registry anchor comment ─────────────────
+    tools_entry = (
+        f'    "{name}": {{\n'
+        f'        "description": {json.dumps(description)},\n'
+        f'        "inputSchema": {schema_str},\n'
+        f'        "fn": {fn_lambda},\n'
+        f'    }},\n'
+        f'    {_USER_TOOL_REG_MARKER}\n'
+    )
+    if _USER_TOOL_REG_MARKER not in server_text:
+        return {"error": "Could not locate TOOLS insertion anchor. The registry marker may be missing."}
+    server_text = server_text.replace(
+        f"    {_USER_TOOL_REG_MARKER}\n",
+        tools_entry,
+        1,
+    )
+
+    # ── Validate new source compiles cleanly (syntax check) ───────────────────
+    try:
+        compile(server_text, str(_SERVER_FILE), "exec")
+    except SyntaxError as exc:
+        return {"error": f"Generated code has a syntax error (not written): {exc}"}
+
+    # ── Write server.py — rollback to original on any failure ─────────────────
+    try:
+        _SERVER_FILE.write_text(server_text)
+    except Exception as exc:
+        return {"error": f"Failed to write server.py: {exc}"}
+
+    # ── Optionally update prompt.json ─────────────────────────────────────────
+    prompt_updated = False
+    if prompt_doc.strip():
+        try:
+            with open(_PROMPT_FILE) as f:
+                pdata = json.load(f)
+            p = pdata["system_prompt"]["prompt"]
+            # Insert tool doc just before the QUICK-REFERENCE section
+            qr_marker = "\u2550" * 55 + "\n## TOOL SELECTION QUICK-REFERENCE"
+            if qr_marker in p:
+                tool_doc = (
+                    f"\n**{name}** (user-defined)\n"
+                    f"  Description: {description}\n"
+                    f"  Usage: {prompt_doc}\n\n"
+                )
+                p = p.replace(qr_marker, tool_doc + qr_marker)
+                # Add a quick-reference table row (insert before "List user-installed" row)
+                list_row = "| List user-installed custom tools"
+                if list_row in p:
+                    p = p.replace(
+                        list_row,
+                        f"| {description[:52]:<52} | {name:<27} |\n{list_row}",
+                    )
+            pdata["system_prompt"]["prompt"] = p
+            with open(_PROMPT_FILE, "w") as f:
+                json.dump(pdata, f, indent=2, ensure_ascii=False)
+            prompt_updated = True
+        except Exception:
+            pass  # prompt.json update is best-effort; don't fail the whole call
+
+    return {
+        "success":           True,
+        "tool_name":         name,
+        "function_name":     func_name,
+        "security_warnings": security_warnings,
+        "prompt_updated":    prompt_updated,
+        "note": (
+            f"Tool '{name}' installed in server.py. "
+            "Restart the agent (syscontrol) for it to take effect."
+        ),
+        "code_written": implementation,
+    }
+
+
 # ── Tool registry ─────────────────────────────────────────────────────────────
 
 TOOLS = {
@@ -3948,6 +4127,57 @@ TOOLS = {
         },
         "fn": lambda args: eject_disk(args["mountpoint"]),
     },
+    # ── Tool self-extension ────────────────────────────────────────────────────
+    "list_user_tools": {
+        "description": "Lists all custom tools installed via create_tool.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: list_user_tools(),
+    },
+    "create_tool": {
+        "description": (
+            "Generates, validates, and installs a new MCP tool permanently into the server. "
+            "Requires allow_tool_creation: true in ~/.syscontrol/config.json. "
+            "The tool is available after restarting the agent."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "snake_case tool identifier, e.g. 'get_spotify_track'.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "One-sentence description of what the tool does.",
+                },
+                "parameters_schema": {
+                    "type": "object",
+                    "description": "JSON Schema object for tool inputs. Omit for no-arg tools.",
+                },
+                "implementation": {
+                    "type": "string",
+                    "description": (
+                        "Complete Python function definition(s). "
+                        "stdlib is available; add 'import X' inside the function for extras."
+                    ),
+                },
+                "prompt_doc": {
+                    "type": "string",
+                    "description": "Optional usage notes to insert into the system prompt.",
+                },
+            },
+            "required": ["name", "description", "implementation"],
+        },
+        "fn": lambda args: create_tool(
+            args.get("name", ""),
+            args.get("description", ""),
+            args.get("parameters_schema"),
+            args.get("implementation", ""),
+            args.get("prompt_doc", ""),
+        ),
+    },
+    # ── User-Defined Tools (registry) ──────────────────────────────────────────
+    # (entries inserted here by create_tool — do not remove this comment)
 }
 
 
