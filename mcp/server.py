@@ -55,6 +55,33 @@ except Exception:
 
 GPU_AVAILABLE = GPU_BACKEND is not None
 
+# ── Platform constants (computed once at startup) ─────────────────────────────
+_SYSTEM  = platform.system()
+_MACHINE = platform.machine()
+IS_MACOS = _SYSTEM == "Darwin"
+IS_LINUX = _SYSTEM == "Linux"
+IS_WIN   = _SYSTEM == "Windows"
+
+# ── Shared thread pool for parallel metric collection ─────────────────────────
+# Reused across calls — avoids per-call thread creation/teardown overhead.
+_METRICS_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="syscontrol-metrics")
+
+# ── pynvml handle cache (handles are stable for the process lifetime) ─────────
+_NVML_HANDLES: list = []
+
+
+def _get_nvml_handles() -> list:
+    """Return cached pynvml device handles; populated lazily on first call."""
+    global _NVML_HANDLES
+    if _NVML_HANDLES:
+        return _NVML_HANDLES
+    try:
+        count = pynvml.nvmlDeviceGetCount()
+        _NVML_HANDLES = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
+    except Exception:
+        _NVML_HANDLES = []
+    return _NVML_HANDLES
+
 
 # ── Reminder storage ──────────────────────────────────────────────────────────
 
@@ -104,13 +131,17 @@ class ReminderChecker:
 
     def _loop(self):
         while True:
-            self._check()
-            time.sleep(15)
+            next_due = self._check()
+            # Sleep until the next reminder is due, capped at 15 s so new
+            # reminders set by other tools are noticed quickly.
+            time.sleep(min(15.0, max(1.0, next_due)))
 
-    def _check(self):
+    def _check(self) -> float:
+        """Check and fire due reminders. Returns seconds until the next unfired reminder."""
         now = datetime.datetime.now()
         cutoff = now - datetime.timedelta(days=7)
         to_fire = []
+        next_due = float("inf")
         with _REMINDER_LOCK:
             reminders = _load_reminders()
             changed = False
@@ -132,12 +163,17 @@ class ReminderChecker:
                     to_fire.append(r["message"])
                     r["fired"] = True
                     changed = True
+                else:
+                    secs = (fire_at - now).total_seconds()
+                    if secs < next_due:
+                        next_due = secs
                 survivors.append(r)
             if changed:
                 _save_reminders(survivors)
         # Fire notifications outside the lock to avoid blocking set/list/cancel
         for msg in to_fire:
             self._fire(msg)
+        return next_due
 
     @staticmethod
     def _fire(message: str):
@@ -385,12 +421,11 @@ def get_gpu_usage() -> dict:
 
     if GPU_BACKEND == "pynvml":
         try:
-            count = pynvml.nvmlDeviceGetCount()
-            if count == 0:
+            handles = _get_nvml_handles()
+            if not handles:
                 return {"error": "No GPUs detected"}
             gpus = []
-            for i in range(count):
-                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            for i, h in enumerate(handles):
                 util = pynvml.nvmlDeviceGetUtilizationRates(h)
                 mem  = pynvml.nvmlDeviceGetMemoryInfo(h)
                 try:
@@ -413,6 +448,8 @@ def get_gpu_usage() -> dict:
                 })
             return {"gpus": gpus}
         except pynvml.NVMLError as e:
+            global _NVML_HANDLES
+            _NVML_HANDLES = []  # invalidate cache on NVML error so next call retries
             return {"error": f"NVML error: {e}"}
 
     try:
@@ -614,13 +651,11 @@ def _gpu_with_chart():
 
 def get_hardware_profile(use_case: str = "") -> dict:
     """Aggregate hardware specs, live pressure, OC capability, upgrade feasibility, and use-case bottleneck analysis."""
-    from concurrent.futures import ThreadPoolExecutor
     # Run all four independent data-source calls in parallel.
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        f_specs = ex.submit(get_device_specs)
-        f_cpu   = ex.submit(get_cpu_usage)
-        f_ram   = ex.submit(get_ram_usage)
-        f_gpu   = ex.submit(get_gpu_usage)
+    f_specs = _METRICS_EXECUTOR.submit(get_device_specs)
+    f_cpu   = _METRICS_EXECUTOR.submit(get_cpu_usage)
+    f_ram   = _METRICS_EXECUTOR.submit(get_ram_usage)
+    f_gpu   = _METRICS_EXECUTOR.submit(get_gpu_usage)
     specs    = f_specs.result()
     cpu_live = f_cpu.result()
     ram_live = f_ram.result()
@@ -670,8 +705,7 @@ def get_battery_status() -> dict:
 
 
 def get_temperature_sensors() -> dict:
-    system = platform.system()
-    if system == "Darwin":
+    if IS_MACOS:
         return {
             "platform": "macOS",
             "available": False,
@@ -685,7 +719,7 @@ def get_temperature_sensors() -> dict:
         }
     if not hasattr(psutil, "sensors_temperatures"):
         return {
-            "platform": system,
+            "platform": _SYSTEM,
             "available": False,
             "sensors": {},
             "message": "psutil.sensors_temperatures() not available on this platform/version.",
@@ -693,10 +727,10 @@ def get_temperature_sensors() -> dict:
     try:
         raw = psutil.sensors_temperatures()
     except Exception as e:
-        return {"platform": system, "available": False, "sensors": {}, "message": f"Failed to read sensors: {e}"}
+        return {"platform": _SYSTEM, "available": False, "sensors": {}, "message": f"Failed to read sensors: {e}"}
     if not raw:
         return {
-            "platform": system,
+            "platform": _SYSTEM,
             "available": True,
             "sensors": {},
             "message": "No sensors detected (may require elevated privileges on Linux).",
@@ -712,7 +746,7 @@ def get_temperature_sensors() -> dict:
             }
             for e in entries
         ]
-    return {"platform": system, "available": True, "message": "", "sensors": sensors}
+    return {"platform": _SYSTEM, "available": True, "message": "", "sensors": sensors}
 
 
 def get_system_uptime() -> dict:
@@ -767,8 +801,7 @@ def get_system_alerts() -> dict:
     if GPU_AVAILABLE:
         try:
             if GPU_BACKEND == "pynvml":
-                for i in range(pynvml.nvmlDeviceGetCount()):
-                    h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                for i, h in enumerate(_get_nvml_handles()):
                     util = pynvml.nvmlDeviceGetUtilizationRates(h)
                     name = pynvml.nvmlDeviceGetName(h)
                     if isinstance(name, bytes):
@@ -849,9 +882,7 @@ def get_network_connections() -> dict:
 
 
 def get_startup_items() -> dict:
-    system = platform.system()
-
-    if system == "Darwin":
+    if IS_MACOS:
         scan_dirs = [
             (pathlib.Path.home() / "Library" / "LaunchAgents", "user"),
             (pathlib.Path("/Library/LaunchAgents"), "system"),
@@ -885,7 +916,7 @@ def get_startup_items() -> dict:
                     })
         return {"platform": "macOS", "items": items, "count": len(items)}
 
-    if system == "Windows":
+    if IS_WIN:
         try:
             import winreg
         except ImportError:
@@ -910,7 +941,7 @@ def get_startup_items() -> dict:
                 continue
         return {"platform": "Windows", "items": items, "count": len(items)}
 
-    if system == "Linux":
+    if IS_LINUX:
         autostart = pathlib.Path.home() / ".config" / "autostart"
         items = []
         if autostart.exists():
@@ -938,7 +969,7 @@ def get_startup_items() -> dict:
                     continue
         return {"platform": "Linux", "items": items, "count": len(items)}
 
-    return {"platform": system, "error": f"Not supported on {system}", "items": [], "count": 0}
+    return {"platform": _SYSTEM, "error": f"Not supported on {_SYSTEM}", "items": [], "count": 0}
 
 
 def get_process_details(pid: int) -> dict:
@@ -1062,8 +1093,7 @@ def get_device_specs() -> dict:
     if GPU_AVAILABLE:
         try:
             if GPU_BACKEND == "pynvml":
-                for i in range(pynvml.nvmlDeviceGetCount()):
-                    h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                for i, h in enumerate(_get_nvml_handles()):
                     name = pynvml.nvmlDeviceGetName(h)
                     if isinstance(name, bytes):
                         name = name.decode()
@@ -1083,10 +1113,10 @@ def get_device_specs() -> dict:
 
     return {
         "os": {
-            "system": platform.system(),
+            "system": _SYSTEM,
             "release": platform.release(),
             "version": platform.version(),
-            "machine": platform.machine(),
+            "machine": _MACHINE,
             "hostname": platform.node(),
         },
         "cpu": {
@@ -1105,14 +1135,13 @@ def get_device_specs() -> dict:
 
 def get_full_snapshot() -> dict:
     """Aggregate snapshot of all metrics — all sources fetched in parallel."""
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        f_cpu     = ex.submit(get_cpu_usage)
-        f_ram     = ex.submit(get_ram_usage)
-        f_gpu     = ex.submit(get_gpu_usage)
-        f_disk    = ex.submit(get_disk_usage)
-        f_net     = ex.submit(get_network_usage)
-        f_top_cpu = ex.submit(get_top_processes, 5, "cpu")
-        f_top_mem = ex.submit(get_top_processes, 5, "memory")
+    f_cpu     = _METRICS_EXECUTOR.submit(get_cpu_usage)
+    f_ram     = _METRICS_EXECUTOR.submit(get_ram_usage)
+    f_gpu     = _METRICS_EXECUTOR.submit(get_gpu_usage)
+    f_disk    = _METRICS_EXECUTOR.submit(get_disk_usage)
+    f_net     = _METRICS_EXECUTOR.submit(get_network_usage)
+    f_top_cpu = _METRICS_EXECUTOR.submit(get_top_processes, 5, "cpu")
+    f_top_mem = _METRICS_EXECUTOR.submit(get_top_processes, 5, "memory")
     return {
         "cpu":                    f_cpu.result(),
         "ram":                    f_ram.result(),
@@ -1408,7 +1437,7 @@ def get_weather(location: str = "", units: str = "imperial") -> dict:
 # ── App update checker ────────────────────────────────────────────────────────
 
 def check_app_updates() -> dict:
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "check_app_updates is currently macOS-only."}
 
     results: dict = {
@@ -1746,13 +1775,12 @@ def network_latency_check() -> dict:
 
     results: dict = {}
     lock = threading.Lock()
-    _sys = platform.system()
 
     def _ping(label: str, host: str) -> None:
         try:
             cmd = (
                 ["ping", "-n", "4", "-w", "2000", host]
-                if _sys == "Windows"
+                if IS_WIN
                 else ["ping", "-c", "4", "-W", "2", host]
             )
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -1887,7 +1915,7 @@ def get_time_machine_status() -> dict:
     Return macOS Time Machine backup status, last backup time, and destination.
     Async: YES — tmutil status, latestbackup, and destinationinfo run in parallel.
     """
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "Time Machine is macOS-only."}
     if not shutil.which("tmutil"):
         return {"error": "tmutil not found."}
@@ -1975,9 +2003,8 @@ def get_time_machine_status() -> dict:
 def tail_system_logs(lines: int = 50, filter_str: str = "") -> dict:
     """Tail recent system logs. macOS: unified log (last 5 min). Linux: journalctl."""
     lines  = max(10, min(lines, 500))
-    system = platform.system()
 
-    if system == "Darwin":
+    if IS_MACOS:
         cmd = ["log", "show", "--last", "5m", "--style", "compact"]
         if filter_str:
             cmd += ["--predicate", f'eventMessage CONTAINS[c] "{filter_str}"']
@@ -1997,7 +2024,7 @@ def tail_system_logs(lines: int = 50, filter_str: str = "") -> dict:
         except Exception as exc:
             return {"error": f"Failed to read logs: {exc}"}
 
-    if system == "Linux":
+    if IS_LINUX:
         if shutil.which("journalctl"):
             cmd = ["journalctl", "-n", str(lines), "--no-pager", "-o", "short"]
             if filter_str:
@@ -2029,7 +2056,7 @@ def tail_system_logs(lines: int = 50, filter_str: str = "") -> dict:
                 return {"error": "Permission denied reading /var/log/syslog. Try sudo."}
         return {"error": "No supported log source found (journalctl or /var/log/syslog)."}
 
-    return {"error": f"tail_system_logs is not supported on {system}."}
+    return {"error": f"tail_system_logs is not supported on {_SYSTEM}."}
 
 
 # ── Browser / Web tools ──────────────────────────────────────────────────────
@@ -2058,7 +2085,7 @@ def _browser_permission_required() -> dict:
 
 def _running_browser() -> str | None:
     """Return the name of the first recognised browser that is currently running."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return None
     for app in _CHROMIUM_APPS + [_SAFARI_APP]:
         try:
@@ -2225,7 +2252,7 @@ def browser_open_url(url: str) -> dict:
         return _browser_permission_required()
     if not url.startswith(("http://", "https://", "file://")):
         url = "https://" + url
-    if platform.system() == "Darwin":
+    if IS_MACOS:
         try:
             subprocess.run(["open", url], check=True, timeout=10)
             return {"success": True, "url": url, "action": "opened in default browser"}
@@ -2251,7 +2278,7 @@ def browser_navigate(url: str) -> dict:
     """
     if not _browser_permission_granted():
         return _browser_permission_required()
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return browser_open_url(url)   # graceful fallback on non-macOS
 
     # Normalise scheme
@@ -2293,7 +2320,7 @@ def browser_get_page() -> dict:
     """
     if not _browser_permission_granted():
         return _browser_permission_required()
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "browser_get_page requires macOS (uses AppleScript)."}
 
     browser = _running_browser()
@@ -2353,7 +2380,7 @@ def send_imessage(recipient: str, message: str) -> dict:
     denied = _permission_check("allow_messaging", "send_imessage")
     if denied:
         return denied
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "send_imessage requires macOS."}
     if not recipient or not message:
         return {"error": "recipient and message are required."}
@@ -2402,7 +2429,7 @@ def get_imessage_history(contact: str, limit: int = 20) -> dict:
     denied = _permission_check("allow_message_history", "get_imessage_history")
     if denied:
         return denied
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "get_imessage_history requires macOS."}
     import sqlite3 as _sqlite3
 
@@ -2461,7 +2488,7 @@ def get_imessage_history(contact: str, limit: int = 20) -> dict:
 
 def get_clipboard() -> dict:
     """Return the current contents of the system clipboard."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "get_clipboard is currently macOS only (uses pbpaste)."}
     try:
         result = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=5)
@@ -2477,7 +2504,7 @@ def get_clipboard() -> dict:
 
 def set_clipboard(text: str) -> dict:
     """Write text to the system clipboard."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "set_clipboard is currently macOS only (uses pbcopy)."}
     try:
         subprocess.run(
@@ -2502,7 +2529,7 @@ def take_screenshot(path: str = "") -> tuple:
         return denied, ""
     import tempfile as _tempfile
 
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "take_screenshot requires macOS (uses screencapture)."}, ""
 
     with _tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -2552,7 +2579,7 @@ def take_screenshot(path: str = "") -> tuple:
 
 def open_app(name: str) -> dict:
     """Open an application by name using macOS `open -a`."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "open_app requires macOS."}
     if not name:
         return {"error": "app name is required."}
@@ -2570,7 +2597,7 @@ def open_app(name: str) -> dict:
 
 def quit_app(name: str, force: bool = False) -> dict:
     """Gracefully quit an application by name using AppleScript."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "quit_app requires macOS."}
     if not name:
         return {"error": "app name is required."}
@@ -2604,7 +2631,7 @@ def quit_app(name: str, force: bool = False) -> dict:
 
 def get_volume() -> dict:
     """Return the current output volume and mute state."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "get_volume requires macOS."}
     try:
         proc = subprocess.run(
@@ -2635,7 +2662,7 @@ def get_volume() -> dict:
 
 def set_volume(level: int) -> dict:
     """Set the system output volume (0–100)."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "set_volume requires macOS."}
     level = max(0, min(100, int(level)))
     try:
@@ -2663,7 +2690,7 @@ def get_wifi_networks() -> dict:
     Uses the `airport` CLI when available (macOS ≤13), otherwise falls back to
     `system_profiler SPAirPortDataType` which works on macOS 14+.
     """
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "get_wifi_networks requires macOS."}
 
     # ── Try airport (macOS ≤13) ──────────────────────────────────────────────
@@ -2836,14 +2863,23 @@ def write_file(path: str, content: str, overwrite: bool = True) -> dict:
 _SYSCONTROL_CONFIG_FILE = _REMINDER_DIR / "config.json"
 
 
+_CONFIG_CACHE: dict = {}
+_CONFIG_TTL: float = 5.0           # seconds; config changes take effect within one TTL window
+_CONFIG_CACHE_TIME: float = float("-inf")  # force a disk read on the very first call
+
+
 def _load_config() -> dict:
-    """Load ~/.syscontrol/config.json, returning {} on any error."""
+    """Load ~/.syscontrol/config.json, cached for _CONFIG_TTL seconds."""
+    global _CONFIG_CACHE, _CONFIG_CACHE_TIME
+    now = time.monotonic()
+    if now - _CONFIG_CACHE_TIME < _CONFIG_TTL:
+        return _CONFIG_CACHE
     try:
-        if _SYSCONTROL_CONFIG_FILE.exists():
-            return json.loads(_SYSCONTROL_CONFIG_FILE.read_text())
-    except Exception:
-        pass
-    return {}
+        _CONFIG_CACHE = json.loads(_SYSCONTROL_CONFIG_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        _CONFIG_CACHE = {}
+    _CONFIG_CACHE_TIME = now
+    return _CONFIG_CACHE
 
 
 def _permission_check(flag: str, tool_name: str) -> dict | None:
@@ -2909,7 +2945,7 @@ def get_calendar_events(lookahead_days: int = 7) -> dict:
     denied = _permission_check("allow_calendar", "get_calendar_events")
     if denied:
         return denied
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "get_calendar_events requires macOS."}
     lookahead_days = max(1, min(lookahead_days, 90))
     script = f"""
@@ -2983,7 +3019,7 @@ def get_contact(name: str) -> dict:
     denied = _permission_check("allow_contacts", "get_contact")
     if denied:
         return denied
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "get_contact requires macOS."}
     if not name:
         return {"error": "name is required."}
@@ -3054,7 +3090,7 @@ return resultList as string
 
 def run_shortcut(name: str, input_text: str = "") -> dict:
     """Run a macOS Shortcut by name (Shortcuts.app)."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "run_shortcut requires macOS."}
     if not name:
         return {"error": "name is required."}
@@ -3091,7 +3127,7 @@ def get_frontmost_app() -> dict:
     denied = _permission_check("allow_accessibility", "get_frontmost_app")
     if denied:
         return denied
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "get_frontmost_app requires macOS."}
     script = 'tell application "System Events" to get name of first process whose frontmost is true'
     try:
@@ -3117,7 +3153,7 @@ def toggle_do_not_disturb(enabled: bool) -> dict:
     Enable or disable macOS Focus / Do Not Disturb.
     Uses the macOS `shortcuts` CLI to run the built-in Focus shortcuts.
     """
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "toggle_do_not_disturb requires macOS."}
     # Attempt multiple known shortcut names for DnD/Focus
     if enabled:
@@ -3168,7 +3204,7 @@ def toggle_do_not_disturb(enabled: bool) -> dict:
 
 def eject_disk(mountpoint: str) -> dict:
     """Unmount and eject a disk by its mountpoint (e.g. '/Volumes/MyDrive')."""
-    if platform.system() != "Darwin":
+    if not IS_MACOS:
         return {"error": "eject_disk requires macOS."}
     if not mountpoint:
         return {"error": "mountpoint is required."}

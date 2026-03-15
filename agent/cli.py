@@ -23,6 +23,13 @@ import sys
 import threading
 from pathlib import Path
 
+try:
+    import fcntl as _fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
+
+import openai
 from openai import OpenAI
 
 from agent.core import (
@@ -38,12 +45,12 @@ from agent.core import (
 MEMORY_FILE = Path(__file__).parent.parent / "SysControl_Memory.md"
 
 # Phrases that signal the user wants to end the session
-EXIT_PHRASES = {
+EXIT_PHRASES: frozenset[str] = frozenset({
     "exit", "quit", "bye", "goodbye", "good bye", "farewell",
     "see ya", "see you", "cya", "later", "take care", "peace",
     "done", "close", "end", "stop", ":q", "q", "adios", "adieu",
     "ttyl", "ttfn", "night", "goodnight", "good night",
-}
+})
 
 _PRIVACY_NOTICE = (
     f"\n{DIM}╔══════════════════════════════════════════════════════════════╗\n"
@@ -126,15 +133,22 @@ def _append_memory(messages: list[dict], fmt: str = "md") -> None:
         separator += body.replace("**You:**", "You:").replace("**Assistant:**", "Assistant:")
         separator += "\n"
 
-    # Atomically create the file with a header the first time (open "x" is
-    # exclusive-create on POSIX — safe even with concurrent CLI sessions).
-    try:
-        with MEMORY_FILE.open("x", encoding="utf-8") as fh:
-            fh.write("# SysControl Memory\n\nThis file is appended automatically. Edit freely.\n")
-    except FileExistsError:
-        pass
+    # Open for append (creates if missing); use an exclusive file lock so
+    # concurrent CLI sessions don't interleave their writes.
     with MEMORY_FILE.open("a", encoding="utf-8") as fh:
-        fh.write(separator)
+        if _HAS_FCNTL:
+            _fcntl.flock(fh, _fcntl.LOCK_EX)
+        try:
+            # Seek to the true end of file *after* acquiring the lock so that
+            # tell() reflects any bytes written by a concurrent session between
+            # our open() and flock() calls.
+            fh.seek(0, 2)
+            if fh.tell() == 0:
+                fh.write("# SysControl Memory\n\nThis file is appended automatically. Edit freely.\n")
+            fh.write(separator)
+        finally:
+            if _HAS_FCNTL:
+                _fcntl.flock(fh, _fcntl.LOCK_UN)
 
     print(f"{GREEN}✓ Session appended to {MEMORY_FILE.name}{RESET}")
 
@@ -149,6 +163,53 @@ def print_banner() -> None:
     memory = load_memory()
     if memory:
         print(f"{DIM}  Memory file found — previous context will be included.{RESET}")
+
+
+# ── Error classification ───────────────────────────────────────────────────────
+
+class _LLMError(Exception):
+    """Wraps errors from the OpenAI/Ollama API call."""
+
+class _ToolError(Exception):
+    """Wraps errors from MCP tool execution."""
+
+class _MCPError(Exception):
+    """Wraps errors from the MCP subprocess itself (crash or closed pipe)."""
+
+
+# ── History management ────────────────────────────────────────────────────────
+
+MAX_HISTORY_MESSAGES = 40  # ~20 user turns; keeps context well within model limits
+
+
+def _prune_history(messages: list[dict], max_messages: int = MAX_HISTORY_MESSAGES) -> list[dict]:
+    """
+    Trim message history to at most max_messages entries while preserving
+    tool-call coherence: never separate an assistant tool_calls message from
+    the tool result messages that follow it.
+
+    Groups the history into user-anchored turn chunks, then drops the oldest
+    chunks until the total fits within the budget.
+    """
+    if len(messages) <= max_messages:
+        return messages
+
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    for msg in messages:
+        if msg["role"] == "user" and current:
+            groups.append(current)
+            current = []
+        current.append(msg)
+    if current:
+        groups.append(current)
+
+    total = sum(len(g) for g in groups)
+    while groups and total > max_messages:
+        total -= len(groups[0])
+        groups.pop(0)
+
+    return [msg for group in groups for msg in group]
 
 
 # ── Agentic Loop ──────────────────────────────────────────────────────────────
@@ -166,15 +227,29 @@ def run_turn(
     print(f"\n{BOLD}{GREEN}Assistant:{RESET} ", end="", flush=True)
 
     while True:
+        # Trim history to prevent context-window overflow on long sessions.
+        messages[:] = _prune_history(messages)
+
         # ── Stream response ────────────────────────────────────────────────
         # system_message is prepended once; messages already contains history.
-        stream = ollama_client.chat.completions.create(
-            model=model,
-            max_tokens=MAX_TOKENS,
-            tools=tools,
-            messages=[system_message] + messages,
-            stream=True,
-        )
+        try:
+            stream = ollama_client.chat.completions.create(
+                model=model,
+                max_tokens=MAX_TOKENS,
+                tools=tools,
+                messages=[system_message] + messages,
+                stream=True,
+            )
+        except openai.APITimeoutError as exc:
+            raise _LLMError(f"LLM request timed out ({exc})") from exc
+        except openai.APIConnectionError as exc:
+            raise _LLMError(f"Cannot reach LLM endpoint: {exc}") from exc
+        except openai.AuthenticationError as exc:
+            raise _LLMError(f"Invalid API key: {exc}") from exc
+        except openai.APIStatusError as exc:
+            raise _LLMError(f"LLM API error {exc.status_code}: {exc.message}") from exc
+        except openai.OpenAIError as exc:
+            raise _LLMError(f"LLM error: {exc}") from exc
 
         # Use a fragment list to avoid O(n²) string copies during streaming.
         content_parts: list[str] = []
@@ -251,7 +326,12 @@ def run_turn(
             for tc in tool_calls:
                 print_tool_call(tc["function"]["name"])
 
-            results = pool.call_tools_parallel(tool_calls)
+            try:
+                results = pool.call_tools_parallel(tool_calls)
+            except RuntimeError as exc:
+                raise _MCPError(f"MCP server crashed or closed: {exc}") from exc
+            except Exception as exc:
+                raise _ToolError(f"Tool execution failed: {exc}") from exc
 
             for tc_id, _name, result in results:
                 messages.append({
@@ -439,8 +519,18 @@ def main() -> None:
 
             try:
                 run_turn(ollama_client, pool, tools, system_message, messages, model)
+            except _LLMError as e:
+                print(f"\n{YELLOW}LLM error: {e}{RESET}")
+                print(f"{DIM}  Check your API key or network connection, then try again.{RESET}")
+            except _MCPError as e:
+                print(f"\n{YELLOW}MCP server error: {e}{RESET}")
+                print(f"{DIM}  The system monitor backend crashed — restarting is recommended.{RESET}")
+                break
+            except _ToolError as e:
+                print(f"\n{YELLOW}Tool error: {e}{RESET}")
+                print(f"{DIM}  The tool failed but the session is intact — try again.{RESET}")
             except Exception as e:
-                print(f"\n{YELLOW}Error: {e}{RESET}")
+                print(f"\n{YELLOW}Unexpected error: {e}{RESET}")
 
             print()   # blank line between turns
 
