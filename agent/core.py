@@ -162,7 +162,11 @@ class MCPClientPool:
             self._clients.append(new_client)
             return new_client
 
-    def _get_parallel_safe(self) -> set[str]:
+    # Sentinel: distinguishes "server unreachable, allow everything" from a
+    # legitimately loaded (but possibly empty) set of safe tool names.
+    _FALLBACK: frozenset = frozenset()
+
+    def _get_parallel_safe(self) -> frozenset | set[str]:
         """Return the set of tool names that are safe to run concurrently.
 
         Lazily fetches the tool list from the primary MCP client on first call
@@ -175,15 +179,16 @@ class MCPClientPool:
                     t["name"] for t in tools if t.get("parallel", True)
                 }
             except Exception:
-                # If the server is unreachable fall back to treating everything
-                # as safe (original behaviour) so the agent doesn't stall.
-                self._parallel_safe = set()
+                # Server unreachable — use sentinel so _is_parallel_safe
+                # falls back to allowing everything (original behaviour).
+                self._parallel_safe = self._FALLBACK
         return self._parallel_safe
 
     def _is_parallel_safe(self, name: str) -> bool:
         safe = self._get_parallel_safe()
-        # Empty set means fallback mode — allow everything.
-        return (not safe) or (name in safe)
+        if safe is self._FALLBACK:
+            return True   # error fallback: allow everything
+        return name in safe
 
     def call_tools_parallel(
         self, tool_calls: list[dict]
