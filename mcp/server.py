@@ -1516,12 +1516,16 @@ def check_app_updates() -> dict:
 
     # Run all three checks concurrently via the shared executor.
     futures = [
-        _METRICS_EXECUTOR.submit(_brew),
-        _METRICS_EXECUTOR.submit(_mas),
-        _METRICS_EXECUTOR.submit(_sysupdate),
+        ("brew", _METRICS_EXECUTOR.submit(_brew)),
+        ("mas", _METRICS_EXECUTOR.submit(_mas)),
+        ("softwareupdate", _METRICS_EXECUTOR.submit(_sysupdate)),
     ]
-    for f in futures:
-        f.result(timeout=130)   # brew timeout is 120s; add a small buffer
+    for label, f in futures:
+        try:
+            f.result(timeout=130)   # brew timeout is 120s; add a small buffer
+        except Exception as exc:
+            with lock:
+                results["errors"].append(f"{label} worker failed: {str(exc)}")
 
     total = (
         len(results["brew_formulae"]) + len(results["brew_casks"])
