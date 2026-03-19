@@ -39,9 +39,9 @@ from openai import OpenAI
 from agent.core import (
     BLUE, BOLD, CLOUD_BASE_URL, CLOUD_MODEL, CYAN, DIM, GREEN,
     LOCAL_API_KEY, LOCAL_BASE_URL, LOCAL_MODEL, MAX_TOKENS,
-    POOL_SIZE, RESET, SERVER_PATH, YELLOW,
+    RESET, SERVER_PATH, YELLOW,
     MCPClient, MCPClientPool,
-    _colorize, load_system_prompt, mcp_to_openai_tools, print_tool_call,
+    _colorize, load_system_prompt, mcp_to_openai_tools,
 )
 
 # ── Memory ────────────────────────────────────────────────────────────────────

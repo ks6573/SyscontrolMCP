@@ -22,9 +22,9 @@ from openai import OpenAI  # noqa: F401 — re-exported for downstream imports
 # agent/core.py lives inside agent/, so go up one level to reach mcp/
 SERVER_PATH = Path(__file__).parent.parent / "mcp" / "server.py"
 PROMPT_PATH = Path(__file__).parent.parent / "mcp" / "prompt.json"
-MAX_TOKENS        = 16384
-POOL_SIZE         = 4   # max parallel MCP worker processes
-MAX_PARALLEL_TOOLS = 4  # max tools in a single concurrent batch
+MAX_TOKENS         = 16384
+POOL_SIZE          = 4          # max parallel MCP worker processes
+MAX_PARALLEL_TOOLS = POOL_SIZE  # batch size capped to pool capacity
 
 # ── Provider config ───────────────────────────────────────────────────────────
 
@@ -212,12 +212,12 @@ class MCPClientPool:
             result = self._clients[0].call_tool(name, args)
             return [(tc["id"], name, result)]
 
-        # Partition by parallel safety, preserving original indices.
-        indexed       = list(enumerate(tool_calls))
-        safe_indexed  = [(i, tc) for i, tc in indexed
-                         if self._is_parallel_safe(tc["function"]["name"])]
-        serial_indexed = [(i, tc) for i, tc in indexed
-                          if not self._is_parallel_safe(tc["function"]["name"])]
+        # Partition by parallel safety in a single pass, preserving original indices.
+        safe_indexed: list[tuple[int, dict]]   = []
+        serial_indexed: list[tuple[int, dict]] = []
+        for i, tc in enumerate(tool_calls):
+            (safe_indexed if self._is_parallel_safe(tc["function"]["name"])
+             else serial_indexed).append((i, tc))
 
         results: list[tuple[int, str, str, str]] = []  # (orig_idx, tc_id, name, result)
 
@@ -283,10 +283,6 @@ def mcp_to_openai_tools(mcp_tools: list[dict]) -> list[dict]:
         }
         for t in mcp_tools
     ]
-
-
-def print_tool_call(name: str) -> None:
-    print(f"\n  {DIM}{YELLOW}⚙  {name}{RESET}", flush=True)
 
 
 # ── Markdown → ANSI colorizer ─────────────────────────────────────────────────
