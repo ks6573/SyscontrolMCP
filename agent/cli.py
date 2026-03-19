@@ -19,9 +19,12 @@ import argparse
 import datetime
 import getpass
 import itertools
+import json
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 try:
@@ -417,6 +420,61 @@ def run_turn(
             break
 
 
+# ── Ollama model detection ────────────────────────────────────────────────────
+
+def _fetch_ollama_models(base_url: str = "http://localhost:11434") -> list[str]:
+    """Return sorted list of locally installed Ollama model names.
+    Returns an empty list if Ollama is not running or unreachable (3 s timeout).
+    """
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/api/tags",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read().decode())
+        return sorted(m["name"] for m in data.get("models", []))
+    except Exception:
+        return []
+
+
+def _pick_model(models: list[str]) -> str:
+    """Present a numbered list of models and return the user's choice."""
+    print(f"\n{BOLD}Available local models:{RESET}")
+    for i, name in enumerate(models, 1):
+        print(f"  {CYAN}{i}{RESET}) {name}")
+    print(f"{BOLD}Select model [1-{len(models)}]:{RESET} ", end="", flush=True)
+    while True:
+        try:
+            raw = input("").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{DIM}Goodbye!{RESET}")
+            sys.exit(0)
+        if raw.isdigit() and 1 <= int(raw) <= len(models):
+            return models[int(raw) - 1]
+        if raw in models:
+            return raw
+        print(f"{YELLOW}Please enter a number between 1 and {len(models)}:{RESET} ", end="", flush=True)
+
+
+def _resolve_local_model() -> str:
+    """Detect installed Ollama models and return the user's selection.
+
+    - 0 models / unreachable → warns and returns LOCAL_MODEL fallback
+    - 1 model               → auto-selects it silently
+    - 2+ models             → shows numbered picker
+    """
+    models = _fetch_ollama_models()
+    if not models:
+        print(f"{YELLOW}⚠  No local models detected (is Ollama running?). "
+              f"Using default: {LOCAL_MODEL}{RESET}")
+        return LOCAL_MODEL
+    if len(models) == 1:
+        print(f"{DIM}  Auto-selected the only installed model: {models[0]}{RESET}")
+        return models[0]
+    return _pick_model(models)
+
+
 # ── CLI args ──────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
@@ -461,7 +519,7 @@ def select_provider(args: argparse.Namespace) -> tuple[str, str, str, str]:
 
     # ── Local ──────────────────────────────────────────────────────────────
     if args.provider == "local":
-        model = args.model or LOCAL_MODEL
+        model = args.model or _resolve_local_model()
         return LOCAL_API_KEY, LOCAL_BASE_URL, model, "⚙  Local (Ollama)"
 
     # ── Interactive fallback ───────────────────────────────────────────────
@@ -487,7 +545,7 @@ def select_provider(args: argparse.Namespace) -> tuple[str, str, str, str]:
             return api_key, CLOUD_BASE_URL, model, "☁  Cloud"
 
         elif choice == "local":
-            model = args.model or LOCAL_MODEL
+            model = args.model or _resolve_local_model()
             return LOCAL_API_KEY, LOCAL_BASE_URL, model, "⚙  Local (Ollama)"
 
         else:
