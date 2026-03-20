@@ -28,8 +28,8 @@ class _AutoGrowTextEdit(QTextEdit):
         self._min_lines = 1
         self._max_lines = 5
 
-        self.setFont(QFont("SF Pro Text", 14))
-        self.setPlaceholderText("Ask SysControl anything\u2026")
+        self.setFont(QFont("SF Pro Text", 15))
+        self.setPlaceholderText("Message SysControl\u2026")
         self.setAcceptRichText(False)
 
         self.setStyleSheet(f"""
@@ -37,7 +37,7 @@ class _AutoGrowTextEdit(QTextEdit):
                 background-color: {palette["input_bg"]};
                 color: {palette["input_text"]};
                 border: 1px solid {palette["input_border"]};
-                border-radius: 14px;
+                border-radius: 20px;
                 padding: 10px 14px;
                 selection-background-color: {palette["accent"]};
                 font-size: 14px;
@@ -116,7 +116,7 @@ class InputWidget(QWidget):
 
         # Layout
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 10, 16, 16)
+        layout.setContentsMargins(48, 10, 48, 16)
         layout.setSpacing(8)
         layout.addWidget(self._text_edit, 1)
         layout.addWidget(self._send_btn, 0, Qt.AlignmentFlag.AlignBottom)

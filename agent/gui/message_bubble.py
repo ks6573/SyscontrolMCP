@@ -1,15 +1,16 @@
 """
 SysControl GUI — Message bubble widget.
 
-User messages render as a clean blue bubble (right-aligned, dynamically sized to text).
-Assistant messages show a typing indicator while streaming, then render as Markdown HTML
-on finalize — raw markdown characters are never visible to the user.
+User messages render as a clean neutral bubble (right-aligned, dynamically sized to text).
+Assistant messages stream text progressively with periodic Markdown re-rendering,
+so the user sees tokens as they arrive — raw markdown characters are never visible
+because a debounced renderer converts to HTML every 150ms.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextCursor
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -31,8 +32,8 @@ class MessageBubble(QFrame):
     """
     A single chat message.
 
-    - User:      right-aligned blue bubble, sized to content width.
-    - Assistant: typing indicator while streaming; full markdown HTML on finalize.
+    - User:      right-aligned neutral bubble, sized to content width.
+    - Assistant: avatar + progressive streaming text with debounced Markdown rendering.
     """
 
     def __init__(
@@ -46,11 +47,10 @@ class MessageBubble(QFrame):
         self._palette = palette
         self._raw_text = ""
         self._is_user = role == "user"
+        self._is_finalized = False
 
         self.setStyleSheet("background: transparent; border: none;")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-
-        fg = palette["user_bubble_text"] if self._is_user else palette["asst_bubble_text"]
 
         # ── Text browser ───────────────────────────────────────────────────
         self._browser = QTextBrowser()
@@ -85,21 +85,28 @@ class MessageBubble(QFrame):
                 }}
             """)
 
-        # ── Typing indicator (assistant only) ──────────────────────────────
-        self._typing_label: QLabel | None = None
+        # ── Avatar (assistant only) ───────────────────────────────────────
+        self._avatar: QLabel | None = None
         if not self._is_user:
-            self._typing_label = QLabel("●●●")
-            self._typing_label.setFont(QFont("-apple-system", 16))
-            self._typing_label.setStyleSheet(
-                f"color: {palette['tool_text']}; background: transparent;"
-            )
-            # Animate opacity by cycling the label text
-            self._dot_state = 0
-            self._dot_timer = QTimer(self)
-            self._dot_timer.setInterval(500)
-            self._dot_timer.timeout.connect(self._animate_dots)
-            self._dot_timer.start()
-            self._browser.hide()  # hidden until finalize
+            self._avatar = QLabel("S")
+            self._avatar.setFixedSize(28, 28)
+            self._avatar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._avatar.setFont(QFont("-apple-system", 13, QFont.Weight.Bold))
+            self._avatar.setStyleSheet(f"""
+                QLabel {{
+                    background-color: {palette["avatar_bg"]};
+                    color: #ffffff;
+                    border-radius: 14px;
+                }}
+            """)
+
+        # ── Debounced Markdown renderer (assistant only) ──────────────────
+        self._render_timer: QTimer | None = None
+        if not self._is_user:
+            self._render_timer = QTimer(self)
+            self._render_timer.setSingleShot(True)
+            self._render_timer.setInterval(150)
+            self._render_timer.timeout.connect(self._render_markdown)
 
         # ── Layout ─────────────────────────────────────────────────────────
         outer = QVBoxLayout(self)
@@ -114,23 +121,25 @@ class MessageBubble(QFrame):
             row.addStretch(1)
             row.addWidget(self._browser)
         else:
-            col = QVBoxLayout()
-            col.setContentsMargins(0, 0, 0, 0)
-            col.setSpacing(4)
-            if self._typing_label:
-                col.addWidget(self._typing_label)
-            col.addWidget(self._browser)
-            row.addLayout(col)
+            row.setSpacing(10)
+            row.addWidget(self._avatar, 0, Qt.AlignmentFlag.AlignTop)
+            row.addWidget(self._browser, 1)
 
         outer.addLayout(row)
 
     # ── Public API ─────────────────────────────────────────────────────────
 
     def append_text(self, text: str) -> None:
-        """Accumulate streaming text — kept in _raw_text, not shown yet (typing indicator stays)."""
+        """Append streaming text — shown progressively via cursor insert."""
         self._raw_text += text
-        # For user messages this path isn't called (set_text is used instead).
-        # For assistant messages we intentionally do NOT update the browser here.
+        if not self._is_user:
+            cursor = self._browser.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(text)
+            self._browser.setTextCursor(cursor)
+            # Restart the debounce timer for a markdown re-render
+            if self._render_timer is not None:
+                self._render_timer.start()
 
     def set_text(self, text: str) -> None:
         """Set complete text for a user message bubble."""
@@ -139,11 +148,10 @@ class MessageBubble(QFrame):
         self._adjust_width()   # size bubble to text content
 
     def finalize(self) -> None:
-        """Hide typing indicator; render accumulated text as Markdown HTML."""
-        if self._typing_label:
-            self._dot_timer.stop()
-            self._typing_label.hide()
-        self._browser.show()
+        """Final authoritative Markdown render of the accumulated text."""
+        self._is_finalized = True
+        if self._render_timer is not None:
+            self._render_timer.stop()
 
         if not self._raw_text.strip():
             return
@@ -162,13 +170,16 @@ class MessageBubble(QFrame):
 
     # ── Internal ───────────────────────────────────────────────────────────
 
-    def _animate_dots(self) -> None:
-        """Cycle the typing indicator between ●●● / ●●○ / ●○○."""
-        if self._typing_label is None or not self._typing_label.isVisible():
+    def _render_markdown(self) -> None:
+        """Debounced: re-render accumulated text as Markdown HTML."""
+        if self._is_finalized or not self._raw_text.strip():
             return
-        self._dot_state = (self._dot_state + 1) % 3
-        dots = ["●●●", "●●○", "●○○"]
-        self._typing_label.setText(dots[self._dot_state])
+        if _HAS_MARKDOWN:
+            html = md.markdown(
+                self._raw_text,
+                extensions=["fenced_code", "tables", "nl2br"],
+            )
+            self._browser.setHtml(self._wrap_html(html))
 
     def _adjust_width(self) -> None:
         """For user bubbles: shrink to natural text width, capped at 75% of parent."""
@@ -179,20 +190,20 @@ class MessageBubble(QFrame):
         ideal_w = doc.idealWidth()
         parent = self.parentWidget()
         max_w = min(620, int(parent.width() * 0.75)) if parent else 620
-        target_w = min(int(ideal_w) + 28, max_w)  # 28 = 14px padding × 2
+        target_w = min(int(ideal_w) + 28, max_w)  # 28 = 14px padding x 2
         self._browser.setFixedWidth(max(target_w, 48))
 
     def _adjust_height(self) -> None:
-        """Resize browser to fit its document content."""
+        """Resize browser to fit its document content exactly."""
         if self._is_user:
             self._adjust_width()
         doc_height = self._browser.document().size().height()
-        self._browser.setMinimumHeight(int(doc_height) + 6)
+        self._browser.setFixedHeight(int(doc_height) + 6)
 
     def _wrap_html(self, body: str) -> str:
         """Wrap markdown-generated HTML with inline CSS styled for the current palette."""
         fg = self._palette["asst_bubble_text"]
-        code_bg = self._palette.get("code_bg", "#0a0a0a")
+        code_bg = self._palette.get("code_bg", "#222020")
         accent = self._palette["accent"]
         border = self._palette["border"]
         return f"""

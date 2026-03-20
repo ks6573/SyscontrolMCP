@@ -11,6 +11,7 @@ import atexit
 
 from PySide6.QtCore import Qt
 
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
@@ -45,19 +46,24 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
+        toolbar.setFixedHeight(44)
         self.addToolBar(toolbar)
+
+        self._model_label = QLabel("SysControl")
+        self._model_label.setFont(QFont("-apple-system", 13, QFont.Weight.DemiBold))
+        toolbar.addWidget(self._model_label)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         toolbar.addWidget(spacer)
 
         new_chat_btn = QToolButton()
-        new_chat_btn.setText("New Chat")
+        new_chat_btn.setText("+ New")
         new_chat_btn.clicked.connect(self._on_new_chat)
         toolbar.addWidget(new_chat_btn)
 
         settings_btn = QToolButton()
-        settings_btn.setText("Settings")
+        settings_btn.setText("\u2699")
         settings_btn.clicked.connect(self._on_settings)
         toolbar.addWidget(settings_btn)
 
@@ -137,7 +143,8 @@ class MainWindow(QMainWindow):
     # ── Slots: worker signals ──────────────────────────────────────────────
 
     def _on_worker_ready(self, tool_count: int, label: str, model: str) -> None:
-        self._status_label.setText(f"Connected \u2014 {tool_count} tools \u2014 {label} \u00b7 {model}")
+        self._model_label.setText(model)
+        self._status_label.setText(f"{tool_count} tools \u00b7 {label}")
         self._input.set_enabled(True)
 
     def _on_token(self, text: str) -> None:

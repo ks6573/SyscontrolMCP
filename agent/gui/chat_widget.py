@@ -51,8 +51,8 @@ class ChatWidget(QScrollArea):
         # Inner container widget
         self._container = QWidget()
         self._layout = QVBoxLayout(self._container)
-        self._layout.setContentsMargins(60, 24, 60, 28)
-        self._layout.setSpacing(8)
+        self._layout.setContentsMargins(48, 20, 48, 24)
+        self._layout.setSpacing(16)
         self._layout.addStretch()  # push bubbles to the top initially
 
         self.setWidget(self._container)
