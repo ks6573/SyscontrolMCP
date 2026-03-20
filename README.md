@@ -4,10 +4,9 @@ An AI agent for your Mac that answers questions about your system — and can ex
 
 57 real-time tools covering CPU, RAM, GPU, disk, network, processes, iMessage, clipboard, browser, weather, reminders, Docker, Time Machine, Wi-Fi, calendar, contacts, shell, and more. The agent picks the right tools automatically, runs them in parallel, and answers in plain English.
 
-Three ways to run it:
+Two ways to run it:
 
 - **Terminal agent** (`agent.py`) — conversational REPL powered by Ollama (local) or Ollama Cloud
-- **Remote bridge** (`remote.py`) — control your Mac from Telegram, WhatsApp, or Messenger
 - **Claude Desktop** — connect `mcp/server.py` directly via MCP
 
 ---
@@ -118,14 +117,6 @@ Sensitive tools are **disabled by default**. Enable them in `~/.syscontrol/confi
 ```
 
 Each disabled tool returns an error with the exact flag needed to enable it.
-
----
-
-## Remote Messaging Bridge
-
-Control your Mac from **Telegram**, **WhatsApp**, or **Facebook Messenger** via a Cloudflare-tunnelled webhook — no port-forwarding required.
-
-Full setup: [agent/REMOTE_SETUP.md](agent/REMOTE_SETUP.md)
 
 ---
 

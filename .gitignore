@@ -63,5 +63,9 @@ htmlcov/
 .coverage
 coverage.xml
 
+# ── Remote bridge (tabled for now) ───────────────────────────────────────────
+agent/remote.py
+agent/REMOTE_SETUP.md
+
 # ── Logs ─────────────────────────────────────────────────────────────────────
 *.log
