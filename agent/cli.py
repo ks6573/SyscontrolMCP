@@ -75,28 +75,12 @@ def load_memory() -> str | None:
     return None
 
 
-def _format_conversation(messages: list[dict]) -> str:
-    """Render the message list as a human-readable markdown block."""
-    lines: list[str] = []
-    for msg in messages:
-        role = msg.get("role", "unknown")
-        content = msg.get("content") or ""
-        if role == "system" or not content:
-            continue
-        if role == "user":
-            lines.append(f"**You:** {content}")
-        elif role == "assistant":
-            lines.append(f"**Assistant:** {content}")
-        # Skip tool messages — they're internal plumbing
-    return "\n\n".join(lines)
-
 
 def offer_memory_save(messages: list[dict]) -> None:
     """
-    Ask the user whether to append this session to SysControl_Memory.md.
+    Ask the user if they want to jot a note into SysControl_Memory.md.
     Called just before the agent exits.
     """
-    # Only bother if there's actual conversation to save
     has_content = any(
         m.get("role") in ("user", "assistant") and m.get("content")
         for m in messages
@@ -105,56 +89,41 @@ def offer_memory_save(messages: list[dict]) -> None:
         return
 
     print(_PRIVACY_NOTICE)
-    print(f"{BOLD}Would you like to save this session to memory for future reference?{RESET}")
-    print(f"{DIM}  Memory is appended to SysControl_Memory.md (never overwritten).{RESET}")
-    print(f"{DIM}  Type 'yes'/'no', or choose format: 'md' / 'txt'{RESET}")
-    print(f"{BOLD}Save session? [yes/no/md/txt]:{RESET} ", end="", flush=True)
+    print(f"{BOLD}Anything worth remembering from this session?{RESET}")
+    print(f"{DIM}  Type a short note (e.g. 'User prefers Celsius. Main machine has 32 GB RAM.')  {RESET}")
+    print(f"{DIM}  Or press Enter to skip.{RESET}")
+    print(f"{BOLD}Note:{RESET} ", end="", flush=True)
 
     try:
-        answer = input("").strip().lower()
+        note = input("").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         return
 
-    if answer in ("yes", "y", "md", "markdown"):
-        _append_memory(messages, fmt="md")
-    elif answer in ("txt", "text"):
-        _append_memory(messages, fmt="txt")
+    if note:
+        _append_memory_note(note)
     else:
-        print(f"{DIM}Session not saved.{RESET}")
+        print(f"{DIM}Nothing saved.{RESET}")
 
 
-def _append_memory(messages: list[dict], fmt: str = "md") -> None:
-    """Append the current session to SysControl_Memory.md."""
+def _append_memory_note(note: str) -> None:
+    """Append a single timestamped note line to SysControl_Memory.md."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    body = _format_conversation(messages)
+    entry = f"\n- [{timestamp}] {note}\n"
 
-    if fmt == "md":
-        separator = f"\n\n---\n\n## Session — {timestamp}\n\n{body}\n"
-    else:
-        separator = f"\n\n{'='*60}\nSession — {timestamp}\n{'='*60}\n\n"
-        # Strip markdown bold markers for plain text
-        separator += body.replace("**You:**", "You:").replace("**Assistant:**", "Assistant:")
-        separator += "\n"
-
-    # Open for append (creates if missing); use an exclusive file lock so
-    # concurrent CLI sessions don't interleave their writes.
     with MEMORY_FILE.open("a", encoding="utf-8") as fh:
         if _HAS_FCNTL:
             _fcntl.flock(fh, _fcntl.LOCK_EX)
         try:
-            # Seek to the true end of file *after* acquiring the lock so that
-            # tell() reflects any bytes written by a concurrent session between
-            # our open() and flock() calls.
             fh.seek(0, 2)
             if fh.tell() == 0:
-                fh.write("# SysControl Memory\n\nThis file is appended automatically. Edit freely.\n")
-            fh.write(separator)
+                fh.write("# SysControl Memory\n\n")
+            fh.write(entry)
         finally:
             if _HAS_FCNTL:
                 _fcntl.flock(fh, _fcntl.LOCK_UN)
 
-    print(f"{GREEN}✓ Session appended to {MEMORY_FILE.name}{RESET}")
+    print(f"{GREEN}✓ Note saved to {MEMORY_FILE.name}{RESET}")
 
 
 # ── Banner ────────────────────────────────────────────────────────────────────
@@ -164,9 +133,8 @@ def print_banner() -> None:
     print(f"│               SysControl Agent                      │")
     print(f"│     Your AI system monitoring assistant             │")
     print(f"└─────────────────────────────────────────────────────┘{RESET}")
-    memory = load_memory()
-    if memory:
-        print(f"{DIM}  Memory file found — previous context will be included.{RESET}")
+    if load_memory() is not None:
+        print(f"{DIM}  Memory file found — agent can recall past sessions via read_memory.{RESET}")
 
 
 # ── Error classification ───────────────────────────────────────────────────────
@@ -607,13 +575,14 @@ def main() -> None:
             + "\n".join(f"- {n}" for n in tool_names)
         )
 
-        # Inject saved memory into the system prompt so the agent has prior context
-        memory = load_memory()
         full_system = system_prompt + tool_list_block
-        if memory:
+        if load_memory() is not None:
             full_system += (
-                "\n\n---\n\n# Saved Memory (from previous sessions)\n\n"
-                + memory
+                "\n\n---\n\n# Memory\n\n"
+                "A persistent memory file exists with notes from past sessions. "
+                "Call `read_memory` when the user references something from a previous session, "
+                "asks what you remember, or when prior context seems relevant. "
+                "Call `append_memory_note` to save a key fact mid-session without waiting for exit."
             )
 
         system_message = {"role": "system", "content": full_system}   # built once

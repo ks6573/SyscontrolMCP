@@ -12,6 +12,12 @@ import io
 import json
 import os
 import pathlib
+
+try:
+    import fcntl as _fcntl
+    _HAS_FCNTL = True
+except ImportError:
+    _HAS_FCNTL = False
 import platform
 import plistlib
 import re
@@ -90,8 +96,11 @@ _REMINDER_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Tool self-extension constants ─────────────────────────────────────────────
 # Path to this file — used by create_tool for self-modification.
-_SERVER_FILE = pathlib.Path(__file__)
-_PROMPT_FILE = pathlib.Path(__file__).parent / "prompt.json"
+_SERVER_FILE  = pathlib.Path(__file__)
+_PROMPT_FILE  = pathlib.Path(__file__).parent / "prompt.json"
+# Persistent memory file — shared with the CLI layer.
+_MEMORY_FILE  = pathlib.Path(__file__).parent.parent / "SysControl_Memory.md"
+_MEMORY_LOCK  = threading.Lock()
 # Marker prepended to each user-defined function block in this file.
 _USER_TOOL_FN_MARKER  = "# ── User-Defined Tool:"
 # Anchor comment inside the TOOLS dict where new entries are inserted.
@@ -3203,6 +3212,39 @@ def list_user_tools() -> dict:
     }
 
 
+# ── Memory tools ──────────────────────────────────────────────────────────────
+
+def read_memory() -> dict:
+    """Return the contents of the persistent memory file, or a notice if empty."""
+    if not _MEMORY_FILE.exists():
+        return {"memory": None, "note": "No memory file found. Use append_memory_note to start one."}
+    text = _MEMORY_FILE.read_text(encoding="utf-8").strip()
+    if not text:
+        return {"memory": None, "note": "Memory file exists but is empty."}
+    return {"memory": text}
+
+
+def append_memory_note(note: str) -> dict:
+    """Append a concise note to the persistent memory file."""
+    if not note or not note.strip():
+        return {"error": "Note is empty — nothing saved."}
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry = f"\n- [{timestamp}] {note.strip()}\n"
+    with _MEMORY_LOCK:
+        with _MEMORY_FILE.open("a", encoding="utf-8") as fh:
+            if _HAS_FCNTL:
+                _fcntl.flock(fh, _fcntl.LOCK_EX)
+            try:
+                fh.seek(0, 2)
+                if fh.tell() == 0:
+                    fh.write("# SysControl Memory\n\n")
+                fh.write(entry)
+            finally:
+                if _HAS_FCNTL:
+                    _fcntl.flock(fh, _fcntl.LOCK_UN)
+    return {"saved": note.strip(), "timestamp": timestamp}
+
+
 def create_tool(
     name:               str,
     description:        str,
@@ -4227,6 +4269,36 @@ TOOLS = {
             args.get("implementation", ""),
             args.get("prompt_doc", ""),
         ),
+    },
+    # ── Memory tools ───────────────────────────────────────────────────────────
+    "read_memory": {
+        "description": (
+            "Read the persistent memory file that stores notes and key facts from past sessions. "
+            "Call this when the user references something from a previous session, asks what you remember, "
+            "or when prior context seems relevant to their request."
+        ),
+        "parallel": True,
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "fn": lambda _: read_memory(),
+    },
+    "append_memory_note": {
+        "description": (
+            "Append a concise note or key fact to the persistent memory file. "
+            "Use this proactively when the user shares a preference, important system fact, or decision "
+            "that would be useful to recall in a future session. Keep notes brief (1-3 sentences)."
+        ),
+        "parallel": False,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "note": {
+                    "type": "string",
+                    "description": "The note to save. Be concise — capture the key fact, not the full conversation.",
+                },
+            },
+            "required": ["note"],
+        },
+        "fn": lambda args: append_memory_note(args.get("note", "")),
     },
     # ── User-Defined Tools (registry) ──────────────────────────────────────────
     # (entries inserted here by create_tool — do not remove this comment)
